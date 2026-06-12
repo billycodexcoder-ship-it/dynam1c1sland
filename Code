@@ -1,0 +1,2304 @@
+package zenith.zov.client.hud.elements.component;
+
+import com.darkmagician6.eventapi.EventManager;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.mojang.blaze3d.systems.RenderSystem;
+import dev.redstones.mediaplayerinfo.IMediaSession;
+import dev.redstones.mediaplayerinfo.MediaInfo;
+import dev.redstones.mediaplayerinfo.MediaPlayerInfo;
+import net.minecraft.client.gui.hud.ClientBossBar;
+import net.minecraft.client.gui.screen.ChatScreen;
+import net.minecraft.client.util.math.MatrixStack;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.decoration.ArmorStandEntity;
+import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
+import net.minecraft.util.math.RotationAxis;
+import net.minecraft.util.math.Vec3d;
+import org.lwjgl.opengl.GL11;
+import zenith.zov.Zenith;
+import zenith.zov.base.animations.base.Animation;
+import zenith.zov.base.animations.base.Easing;
+import zenith.zov.base.font.Font;
+import zenith.zov.base.font.Fonts;
+import zenith.zov.base.font.MsdfRenderer;
+import zenith.zov.base.theme.Theme;
+import zenith.zov.client.hud.elements.draggable.DraggableHudElement;
+import zenith.zov.client.modules.impl.misc.ServerHelper;
+import zenith.zov.client.modules.impl.player.Blink;
+import zenith.zov.client.modules.impl.render.Interface;
+import zenith.zov.client.screens.mainmenu.CustomTitleScreen;
+import zenith.zov.utility.colors.Colors;
+import zenith.zov.utility.math.Timer;
+import zenith.zov.utility.render.display.AnimatedNumber;
+import zenith.zov.utility.render.display.Render2DUtil;
+import zenith.zov.utility.render.display.Texture;
+import zenith.zov.utility.render.display.base.BorderRadius;
+import zenith.zov.utility.render.display.base.CustomDrawContext;
+import zenith.zov.utility.render.display.base.Gradient;
+import zenith.zov.utility.render.display.base.color.ColorRGBA;
+import zenith.zov.utility.render.display.shader.DrawUtil;
+import zenith.zov.utility.sounds.LyricsFetcher;
+
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Главный HUD-компонент «Динамический остров» — аналог Dynamic Island от Apple.
+ * Отображает уведомления, состояние PVP, Blink, ивенты, шахты и музыкальный плеер с лирикой.
+ */
+public class DynamicIslandComponent extends DraggableHudElement {
+
+    // -------------------------
+    // Вспомогательный класс для хранения строки лирики с временем (в мс)
+    // -------------------------
+    private static class LyricLine {
+        long timeMs; // время в миллисекундах от начала трека (может быть 0 для unsynced)
+        final String text; // текст строки
+        LyricLine(long timeMs, String text) {
+            this.timeMs = timeMs;
+            this.text = text;
+        }
+    }
+
+    // -------------------------
+    // Настройки лирики (можно менять по вкусу)
+    // -------------------------
+    private static final int MIN_LYRIC_LINES = 10;            // если строк меньше — считаем "мусор" и не показываем
+    private static final int UNSYNC_ALPHA = 60;               // альфа для несинхронной лирики (постоянная)
+    private static final float UNSYNC_FONT_SIZE = 5.8f;       // размер шрифта для несинхронных строк (одинаковый)
+    private static final int UNSYNC_VISIBLE_LINES = 6;        // сколько строк несинхронной лирики показывать одновременно
+    private static final int UNSYNC_SCROLL_STEP = 1;          // шаг скролла для несинхронной лирики
+
+    // Если LRC обрывается слишком рано (например трек 2:00, а тайминги до 0:40) — считаем «мусор»
+    private static final float MIN_SYNC_COVERAGE = 0.70f;     // 70% трека должно быть покрыто таймингами
+    private static final boolean BAD_SYNC_FALLBACK_TO_UNSYNCED = true; // true: покажем как unsynced (со скроллом), false: не покажем вообще
+
+    // -------------------------
+    // Анимации для плавного изменения размеров, прозрачности, состояний
+    // -------------------------
+    private final Animation widthAnim = new Animation(500, Easing.BAKEK_SIZE);
+    private final Animation heightAnim = new Animation(500, Easing.BAKEK_SIZE);
+    private final Animation borderRadiusAnim = new Animation(500, Easing.BAKEK_SIZE);
+    private final Animation mediaStateAnim = new Animation(500, Easing.BAKEK_SIZE);
+    private final Animation pvpStateAnim = new Animation(500, Easing.BAKEK_SIZE);
+    private final Animation notificationStateAnim = new Animation(500, Easing.BAKEK_SIZE);
+    private final Animation blinkStateAnim = new Animation(500, Easing.BAKEK_SIZE);
+    private final Animation eventStateAnim = new Animation(500, Easing.BAKEK_SIZE);
+    private final Animation mineStateAnim = new Animation(500, Easing.BAKEK_SIZE);
+    private final Animation defaultStateAnim = new Animation(500, Easing.BAKEK_SIZE);
+    private final Animation barAnim = new Animation(500, Easing.BAKEK);
+    private final Animation extendingAnim = new Animation(200, Easing.LINEAR);
+    private final Animation[] waveAnims = new Animation[4];
+
+    private final Animation pausingAnim = new Animation(300L, 0.0F, Easing.BAKEK_SIZE);
+
+    // Анимации наведения на кнопки плеера
+    private final Animation hoverPrevious = new Animation(300L, 0.0F, Easing.FIGMA_EASE_IN_OUT);
+    private final Animation hoverPause = new Animation(300L, 0.0F, Easing.FIGMA_EASE_IN_OUT);
+    private final Animation hoverNext = new Animation(300L, 0.0F, Easing.FIGMA_EASE_IN_OUT);
+    private final Animation hoverLyrics = new Animation(300L, 0.0F, Easing.FIGMA_EASE_IN_OUT);
+
+    private final Animation liquidGlassAnimation = new Animation(220, 1f, Easing.QUAD_IN_OUT);
+    private final Animation adaptiveHudColorAnimation = new Animation(300, 1f, Easing.LINEAR);
+    private final Animation rightClickGlintAnimation = new Animation(520, 1f, Easing.FIGMA_EASE_IN_OUT);
+    private final Animation settingsPanelAnimation = new Animation(200, Easing.CUBIC_OUT);
+
+    // Ускоренное «затухание» артистов (чтобы не налезали на название трека)
+    private final Animation artistAlphaAnim = new Animation(160L, 0.0F, Easing.CUBIC_OUT);
+
+    // HUD (время/интернет) — скрывается при раскрытии плеера
+    private final Animation hudAlphaAnim = new Animation(220L, 1.0F, Easing.CUBIC_OUT);
+    private final Animation hudSlideAnim = new Animation(220L, 0.0F, Easing.CUBIC_OUT);
+
+    // Анимация сдвига строк синхронной лирики (плавная смена строки)
+    private final Animation lyricsShiftAnim = new Animation(200, Easing.CUBIC_OUT);
+    private float lyricsCurrentShift = 0f;        // текущий сдвиг при анимации
+    private boolean lyricsAnimating = false;      // идет ли анимация смены строки
+    private int oldLyricIndex = -1;               // индекс строки до анимации
+    private static final float LYRIC_LINE_HEIGHT = 7.0f; // высота одной строки лирики
+
+    // Чтобы окно из 6 строк не прыгало, пока едет анимация, фиксируем базовый индекс
+    private int lyricsWindowBaseIndex = -1;
+
+    private boolean extended = false;     // развёрнут ли плеер
+    private boolean showLyrics = false;   // показывать ли текст песни
+
+    // Полоски для визуализации звука (бары)
+    private float[] targetBarHeights = new float[]{10f, 8f, 6f};
+    private float[] currentBarHeights = new float[]{10f, 8f, 6f};
+    private final Timer barUpdateTimer = new Timer();
+    private final Timer mediaPollTimer = new Timer();
+    private final Timer adaptiveHudColorTimer = new Timer();
+
+    // Уведомления о включении/выключении модулей
+    private String currentModuleNotification = "";
+    private String currentModuleNotificationClean = "";
+    private boolean currentModuleEnabled = true;
+    private final Deque<ModuleToggleNotification> moduleNotifications = new ArrayDeque<>();
+    private final Timer moduleNotificationTimer = new Timer();
+    private static final long MODULE_NOTIFICATION_DURATION = 1700;
+    private static final Pattern PVP_TIMER_PATTERN = Pattern.compile("(\\d+)");
+
+    // Время в миллисекундах для трека (позиция и длительность)
+    private String trackName = null;
+    private String artistsText = null;
+    private long totalTimeMs = 1;
+    private long currentTimeMs = 0;
+    private boolean isPlaying = false;
+    private IMediaSession activeSession = null;
+
+    // Потоки для опроса медиа и загрузки лирики
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final ExecutorService lyricsExecutor = Executors.newSingleThreadExecutor();
+    private final AtomicBoolean polling = new AtomicBoolean(false);
+    private final AtomicBoolean lyricsPolling = new AtomicBoolean(false);
+    private boolean mediaProviderDisabledLogged = false;
+
+    // Обложка альбома
+    private final Identifier artwork = Zenith.id("dynamic_island_cover");
+    private Texture coverTexture = null;
+    private int coverHash = 0;
+    private ColorRGBA mediaColor = ColorRGBA.WHITE; // цвет, вытянутый из обложки
+
+    // Лирика
+    private List<LyricLine> timedLyrics = new ArrayList<>();
+    private boolean lyricsSynced = false;      // есть таймкоды (LRC)
+    private int lyricsScrollIndex = 0;         // индекс скролла для несинхронного текста
+
+    // -1 = "тайминг ещё не наступил" (чтобы первая строка не подсвечивалась до своего времени)
+    private int currentLyricIndex = -1;
+    private int targetLyricIndex = -1;
+
+    private String lastTrackId = "";
+    private String currentLyricsUrl = "";
+
+    // Боссбары (PVP и прочие)
+    private boolean isPvpModeActive = false;
+    private boolean hasNonPvpBossBars = false;
+    private long hideBossBarUntilMs = 0L;
+
+    // Анимация смены текста (для уведомлений)
+    private String currentDisplayText = "Rockstar";
+    private String targetDisplayText = "Rockstar";
+    private float textTransitionProgress = 0f;
+    private boolean isTextTransitioning = false;
+    private String previousText = "";
+
+    // Настройки отображения (флаги)
+    private boolean showNotifications = true;
+    private boolean showPvp = true;
+    private boolean showBlink = true;
+    private boolean showEvent = true;
+    private boolean showMine = true;
+    private boolean showDefault = true;
+    private boolean liquidGlassEnabled = true;
+    private IslandViewMode viewMode = IslandViewMode.OLD;
+    private ColorRGBA adaptiveHudColor = ColorRGBA.WHITE;
+    private boolean adaptiveUseDark = false;
+
+    // Панель настроек (правая кнопка мыши)
+    private boolean settingsPanelOpen = false;
+    private float settingsPanelX = 0f;
+    private float settingsPanelY = 0f;
+
+    // Данные для статусов
+    private String blinkTimeText = "";
+    private boolean blinkPulse = false;
+    private float blinkProgress = 0f;
+    private String eventText = "";
+    private String eventTimeText = "";
+    private ColorRGBA eventColor = Colors.getAccentColor();
+    private String mineType = "";
+    private String mineTimeText = "";
+    private ColorRGBA mineColor = Colors.getAccentColor();
+
+    private StatusType activeStatus = StatusType.DEFAULT; // текущий активный статус
+
+    private long lastRenderTime = 0;
+    private float deltaTime = 0.016f;
+    private AnimatedNumber pvpTimeAnimation;
+    private boolean wasChatScreen = false;
+
+    public enum StatusType {
+        NOTIFICATION, PVP, BLINK, EVENT, MINE, MUSIC, DEFAULT
+    }
+
+    private enum IslandViewMode {
+        OLD, NEW
+    }
+
+    // Внутренний класс для уведомлений о модулях (с анимацией появления/исчезновения)
+    private static final class ModuleToggleNotification {
+        private final String text;
+        private final boolean enabled;
+        private final Timer timer = new Timer();
+        private final Animation showing = new Animation(260L, 0.0F, Easing.FIGMA_EASE_IN_OUT);
+        private ModuleToggleNotification(String text, boolean enabled) {
+            this.text = text;
+            this.enabled = enabled;
+        }
+    }
+
+    private static DynamicIslandComponent instance;
+    public static DynamicIslandComponent getInstance() { return instance; }
+
+    // Геттеры для внешнего доступа
+    public String getTrackName() { return trackName; }
+    public String getArtistsText() { return artistsText; }
+    public boolean hasActiveMusic() { return activeSession != null && trackName != null && !trackName.isEmpty(); }
+    public boolean isExpanded() { return extended; }
+    public boolean isShowLyrics() { return showLyrics; }
+    public StatusType getActiveStatus() { return activeStatus; }
+
+    public boolean shouldHideBossBars() {
+        return isEnabled() && (isPvpModeActive || System.currentTimeMillis() < hideBossBarUntilMs);
+    }
+
+    public boolean isEnabled() {
+        return Interface.INSTANCE != null && Interface.INSTANCE.isDynamicIslandEnabled();
+    }
+
+    public DynamicIslandComponent(String name, float initialX, float initialY, float windowWidth,
+                                  float windowHeight, float offsetX, float offsetY, Align align) {
+        super(name, initialX, initialY, windowWidth, windowHeight, offsetX, offsetY, align);
+
+        // Начальные значения анимаций
+        widthAnim.setValue(48f);
+        heightAnim.setValue(15f);
+        borderRadiusAnim.setValue(6f);
+        mediaStateAnim.setValue(0);
+        pvpStateAnim.setValue(0);
+        notificationStateAnim.setValue(0);
+        blinkStateAnim.setValue(0);
+        eventStateAnim.setValue(0);
+        mineStateAnim.setValue(0);
+        defaultStateAnim.setValue(1);
+        barAnim.setValue(0);
+        rightClickGlintAnimation.setValue(1f);
+
+        // Длительности анимаций
+        widthAnim.setDuration(320L);
+        heightAnim.setDuration(320L);
+        borderRadiusAnim.setDuration(320L);
+        mediaStateAnim.setDuration(300L);
+        pvpStateAnim.setDuration(300L);
+        notificationStateAnim.setDuration(300L);
+        blinkStateAnim.setDuration(300L);
+        eventStateAnim.setDuration(300L);
+        mineStateAnim.setDuration(300L);
+        defaultStateAnim.setDuration(300L);
+        barAnim.setDuration(260L);
+
+        pausingAnim.setDuration(600L);
+
+        for (int i = 0; i < waveAnims.length; i++) {
+            waveAnims[i] = new Animation(400L, 0.0F, Easing.LINEAR);
+            waveAnims[i].setDuration(1000L);
+        }
+
+        artistAlphaAnim.setValue(0f);
+        hudAlphaAnim.setValue(1f);
+        hudSlideAnim.setValue(0f);
+
+        instance = this;
+        EventManager.register(this);
+    }
+
+    @Override
+    public boolean supportsLiquidGlass() { return true; }
+
+    @Override
+    public boolean isLiquidGlassVisible() {
+        return liquidGlassEnabled || liquidGlassAnimation.getValue() > 0.01f;
+    }
+
+    /**
+     * Рендер жидкого стекла (размытие и специальный эффект) под островком.
+     */
+    @Override
+    public void renderLiquidGlass(CustomDrawContext ctx) {
+        float liquidAnim = liquidGlassAnimation.getValue();
+        if (liquidAnim <= 0.01f || mc == null) return;
+
+        checkBossBars();
+
+        float currentWidth = (float) widthAnim.getValue();
+        float currentHeight = (float) heightAnim.getValue();
+        float currentBorderRadius = activeStatus == StatusType.MUSIC
+                ? 7.0f + 11.0f * (float) extendingAnim.getValue()
+                : Math.max(4f, (float) borderRadiusAnim.getValue());
+
+        float drawX = mc.getWindow().getScaledWidth() / 2f - currentWidth / 2f - 1f;
+        float drawY = 7f;
+        if (hasNonPvpBossBars && !isPvpModeActive) drawY += 19f;
+        drawY -= 0.5f;
+
+        float drawW = currentWidth + 2f;
+        float drawH = currentHeight + 1f;
+
+        DrawUtil.drawBlurHudFixed(ctx.getMatrices(), drawX, drawY, drawW, drawH, 21f,
+                BorderRadius.all(currentBorderRadius), ColorRGBA.WHITE.mulAlpha(liquidAnim));
+
+        DrawUtil.drawLiquidRect(ctx.getMatrices(), drawX, drawY, drawW, drawH,
+                BorderRadius.all(currentBorderRadius),
+                Interface.INSTANCE.getLiquidGlassColor().mulAlpha(liquidAnim),
+                2.0f, 25.0f, 0.5f, 1.0f, true, 0.5f, 0.02f);
+
+        drawRightClickGlint(ctx, drawX, drawY, drawW, drawH, currentBorderRadius);
+    }
+
+    /**
+     * Тиковый метод: обновление информации о медиа, боссбарах, анимациях и лирике.
+     */
+    @Override
+    public void tick() {
+        if (mc == null) return;
+
+        boolean isChat = mc.currentScreen instanceof ChatScreen;
+        if (!isChat && settingsPanelOpen) settingsPanelOpen = false;
+        if (wasChatScreen && !isChat && extended && activeStatus == StatusType.MUSIC) extended = false;
+        wasChatScreen = isChat;
+
+        if (mediaPollTimer.finished(200)) {
+            updateMediaInfo();
+            mediaPollTimer.reset();
+        }
+
+        checkBossBars();
+        liquidGlassAnimation.update(liquidGlassEnabled ? 1f : 0f);
+
+        updateAnimations();
+
+        // Синхронная анимация строк (только если есть таймкоды)
+        if (activeStatus == StatusType.MUSIC && showLyrics && lyricsSynced && !timedLyrics.isEmpty()) {
+            long pos = currentTimeMs;
+
+            // пока не дошли до 1-й строки — активной нет
+            long firstTime = timedLyrics.get(0).timeMs;
+            int newIndex = (pos < firstTime) ? -1 : 0;
+
+            if (newIndex != -1) {
+                for (int i = timedLyrics.size() - 1; i >= 0; i--) {
+                    if (pos >= timedLyrics.get(i).timeMs) {
+                        newIndex = i;
+                        break;
+                    }
+                }
+            }
+
+            if (newIndex != targetLyricIndex) {
+                if (!lyricsAnimating) {
+                    oldLyricIndex = currentLyricIndex;
+                    lyricsWindowBaseIndex = oldLyricIndex;
+                }
+                targetLyricIndex = newIndex;
+
+                if (!lyricsAnimating && targetLyricIndex != currentLyricIndex) {
+                    int from = (oldLyricIndex < 0 ? 0 : oldLyricIndex);
+                    int to = (targetLyricIndex < 0 ? 0 : targetLyricIndex);
+
+                    int deltaIndex = to - from;
+                    float startShift = -deltaIndex * LYRIC_LINE_HEIGHT;
+
+                    lyricsShiftAnim.setValue(startShift);
+                    lyricsShiftAnim.setDuration(170);
+                    lyricsShiftAnim.update(0f);
+
+                    lyricsAnimating = true;
+                    lyricsCurrentShift = startShift;
+                }
+            }
+
+            if (lyricsAnimating) {
+                lyricsShiftAnim.update(1f);
+                lyricsCurrentShift = lyricsShiftAnim.getValue();
+                if (Math.abs(lyricsCurrentShift) < 0.01f) {
+                    currentLyricIndex = targetLyricIndex;
+                    lyricsAnimating = false;
+                    lyricsCurrentShift = 0f;
+                    lyricsWindowBaseIndex = -1;
+                }
+            }
+        }
+    }
+
+    /**
+     * Опрос текущего медиа-плеера (через MediaPlayerInfo).
+     * Получаем название трека, исполнителя, обложку, позицию, длительность.
+     */
+    private void updateMediaInfo() {
+        if (isWindowsNativeMediaDisabled()) {
+            if (!mediaProviderDisabledLogged) {
+                mediaProviderDisabledLogged = true;
+                System.err.println("[DynamicIsland] Windows native media polling disabled.");
+            }
+            clearData();
+            return;
+        }
+
+        if (polling.compareAndSet(false, true)) {
+            executor.execute(() -> {
+                try {
+                    if (MediaPlayerInfo.INSTANCE == null) {
+                        if (mc != null) mc.execute(this::clearData);
+                        return;
+                    }
+
+                    final IMediaSession[] localSession = new IMediaSession[1];
+                    final MediaInfo[] localInfo = new MediaInfo[1];
+                    final byte[][] localCover = new byte[1][];
+                    final int[] localCoverHash = new int[1];
+
+                    try {
+                        var sessions = MediaPlayerInfo.INSTANCE.getMediaSessions();
+                        try { sessions.clear(); } catch (Throwable ignored) {}
+                        sessions = MediaPlayerInfo.INSTANCE.getMediaSessions();
+
+                        localSession[0] = sessions.stream()
+                                .filter(s -> s != null && s.getMedia() != null)
+                                .filter(s -> {
+                                    MediaInfo media = s.getMedia();
+                                    return media != null
+                                            && media.getArtist() != null && !media.getArtist().isEmpty()
+                                            && media.getTitle() != null && !media.getTitle().isEmpty();
+                                })
+                                .findFirst().orElse(null);
+
+                        if (localSession[0] != null) localInfo[0] = localSession[0].getMedia();
+                    } catch (Exception e) {
+                        if (mc != null) mc.execute(this::clearData);
+                        return;
+                    }
+
+                    if (localSession[0] != null && localInfo[0] != null && !localInfo[0].getTitle().isEmpty()) {
+                        final String newTrackName = localInfo[0].getTitle();
+                        final String newArtistsText = (localInfo[0].getArtist() != null && !localInfo[0].getArtist().isEmpty())
+                                ? localInfo[0].getArtist() : null;
+
+                        // *** КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: переводим секунды в миллисекунды ***
+                        final long newPosSec = localInfo[0].getPosition();
+                        final long newDurSec = localInfo[0].getDuration();
+                        final long newPosMs = Math.max(0L, newPosSec * 1000L);
+                        final long newDurMs = newDurSec > 0 ? newDurSec * 1000L : 1L;
+                        final boolean newPlaying = localInfo[0].isPlaying();
+
+                        try {
+                            localCover[0] = localInfo[0].getArtworkPng();
+                            if (localCover[0] != null && localCover[0].length > 0)
+                                localCoverHash[0] = Arrays.hashCode(localCover[0]);
+                        } catch (Exception ignored) {}
+
+                        if (mc != null) {
+                            mc.execute(() -> {
+                                activeSession = localSession[0];
+                                trackName = newTrackName;
+                                artistsText = newArtistsText;
+                                totalTimeMs = newDurMs;
+                                currentTimeMs = newPosMs;
+                                isPlaying = newPlaying;
+
+                                String currentTrackId = ((newArtistsText == null ? "" : newArtistsText) + " - " + newTrackName).trim();
+                                if (!currentTrackId.equals(lastTrackId)) {
+                                    lastTrackId = currentTrackId;
+
+                                    // сброс лирики для нового трека
+                                    timedLyrics.clear();
+                                    lyricsSynced = false;
+                                    lyricsScrollIndex = 0;
+
+                                    currentLyricIndex = -1;
+                                    targetLyricIndex = -1;
+                                    oldLyricIndex = -1;
+                                    lyricsAnimating = false;
+                                    lyricsCurrentShift = 0f;
+                                    lyricsWindowBaseIndex = -1;
+
+                                    showLyrics = false;
+                                    fetchLyricsAsync(newArtistsText, newTrackName, currentTrackId, newDurMs);
+
+                                    startTextTransition(currentDisplayText, newTrackName);
+                                }
+
+                                // Обновление обложки
+                                if (localCover[0] == null || localCover[0].length == 0) {
+                                    clearCoverTexture();
+                                    coverHash = 0;
+                                } else if (localCoverHash[0] != coverHash) {
+                                    updateCoverTexture(localCover[0]);
+                                    coverHash = localCoverHash[0];
+                                }
+                            });
+                        }
+                    } else {
+                        if (mc != null) mc.execute(this::clearData);
+                    }
+                } catch (Throwable e) {
+                    System.err.println("Error in media polling: " + e.getMessage());
+                    if (mc != null) mc.execute(this::clearData);
+                } finally {
+                    polling.set(false);
+                }
+            });
+        }
+    }
+
+    private boolean isWindowsNativeMediaDisabled() {
+        return Boolean.getBoolean("zenith.media.disableWindowsNative");
+    }
+
+    private void clearCoverTexture() {
+        if (coverTexture != null) coverTexture = null;
+        coverHash = 0;
+    }
+
+    private void updateCoverTexture(byte[] coverData) {
+        clearCoverTexture();
+        if (coverData != null && coverData.length > 0 && mc != null) {
+            try {
+                coverTexture = new Texture(artwork);
+                Render2DUtil.registerTexture(coverTexture, coverData);
+                mediaColor = extractMediaColor(coverData);
+            } catch (Exception e) {
+                coverTexture = null;
+                mediaColor = ColorRGBA.WHITE;
+            }
+        }
+    }
+
+    /**
+     * Извлечение доминирующего цвета из обложки для использования в фоне островка.
+     */
+    private ColorRGBA extractMediaColor(byte[] coverData) {
+        try {
+            BufferedImage image = ImageIO.read(new ByteArrayInputStream(coverData));
+            if (image == null) return ColorRGBA.WHITE;
+
+            long r = 0, g = 0, b = 0, count = 0;
+            int stepX = Math.max(1, image.getWidth() / 24);
+            int stepY = Math.max(1, image.getHeight() / 24);
+
+            for (int y = 0; y < image.getHeight(); y += stepY) {
+                for (int x = 0; x < image.getWidth(); x += stepX) {
+                    int argb = image.getRGB(x, y);
+                    int alpha = (argb >>> 24) & 0xFF;
+                    if (alpha < 16) continue;
+
+                    r += (argb >>> 16) & 0xFF;
+                    g += (argb >>> 8) & 0xFF;
+                    b += argb & 0xFF;
+                    count++;
+                }
+            }
+
+            if (count == 0) return ColorRGBA.WHITE;
+
+            int rr = (int) (r / count);
+            int gg = (int) (g / count);
+            int bb = (int) (b / count);
+
+            ColorRGBA avg = new ColorRGBA(rr, gg, bb, 255);
+            return avg.mix(ColorRGBA.WHITE, 0.15f);
+        } catch (Exception ignored) {
+            return ColorRGBA.WHITE;
+        }
+    }
+
+    /**
+     * Проверка боссбаров: определяем, есть ли активный PVP, и нужно ли скрывать другие боссбары.
+     */
+    private void checkBossBars() {
+        if (mc.inGameHud == null || mc.inGameHud.getBossBarHud() == null) {
+            isPvpModeActive = false;
+            hasNonPvpBossBars = false;
+            return;
+        }
+
+        isPvpModeActive = false;
+        hasNonPvpBossBars = false;
+
+        for (ClientBossBar bossBar : mc.inGameHud.getBossBarHud().bossBars.values()) {
+            String name = bossBar.getName().getString().toLowerCase();
+            if (name.contains("pvp") || name.contains("пвп")) {
+                isPvpModeActive = true;
+                hideBossBarUntilMs = System.currentTimeMillis() + 250L;
+                break;
+            } else {
+                hasNonPvpBossBars = true;
+            }
+        }
+    }
+
+    /**
+     * Обновление всех анимаций состояний, ширины/высоты островка.
+     */
+    private void updateAnimations() {
+        updateModuleNotifications();
+
+        ModuleToggleNotification activeModuleNotification = getActiveModuleNotification();
+        boolean showModuleNotification = showNotifications && activeModuleNotification != null &&
+                !activeModuleNotification.timer.finished(MODULE_NOTIFICATION_DURATION);
+
+        boolean blinkActive = showBlink && updateBlinkData();
+        boolean eventActive = showEvent && updateEventData();
+        boolean mineActive = showMine && updateMineData();
+        boolean pvpActive = showPvp && isPvpModeActive;
+        boolean showMusic = canShowMusicStatus();
+
+        activeStatus = resolveActiveStatus(showModuleNotification, pvpActive, blinkActive, eventActive, mineActive, showMusic);
+
+        if (activeStatus != StatusType.MUSIC) extended = false;
+        extendingAnim.update(extended && activeStatus == StatusType.MUSIC ? 1f : 0f);
+
+        notificationStateAnim.update(activeStatus == StatusType.NOTIFICATION ? 1 : 0);
+        pvpStateAnim.update(activeStatus == StatusType.PVP ? 1 : 0);
+        blinkStateAnim.update(activeStatus == StatusType.BLINK ? 1 : 0);
+        eventStateAnim.update(activeStatus == StatusType.EVENT ? 1 : 0);
+        mineStateAnim.update(activeStatus == StatusType.MINE ? 1 : 0);
+        mediaStateAnim.update(activeStatus == StatusType.MUSIC ? 1 : 0);
+        defaultStateAnim.update(activeStatus == StatusType.DEFAULT ? 1 : 0);
+
+        Font textFont = Fonts.MEDIUM.getFont(7);
+        float widthTarget;
+        float heightTarget = 15f;
+
+        switch (activeStatus) {
+            case NOTIFICATION -> {
+                String text = activeModuleNotification == null ? " " : activeModuleNotification.text;
+                widthTarget = 22f + textFont.width(text); // TODO тут изменять если надо, ширина при уведомлении // 28 было, щас хз
+                targetDisplayText = text;
+                borderRadiusAnim.update(6f);
+            }
+            case PVP -> {
+                String timerText = getPvpTimerSeconds() + "s";
+                String statusText = "Вы в PVP режиме";
+                widthTarget = computeTimerStatusWidth(statusText, timerText);
+                targetDisplayText = statusText;
+                borderRadiusAnim.update(6f);
+            }
+            case BLINK -> {
+                widthTarget = 86f;
+                targetDisplayText = "Blink";
+                borderRadiusAnim.update(6f);
+            }
+            case EVENT -> {
+                String statusText = eventText.isEmpty() ? "Событие" : eventText;
+                String timerText = eventTimeText.isEmpty() ? "0:00" : eventTimeText;
+                widthTarget = computeTimerStatusWidth(statusText, timerText);
+                targetDisplayText = statusText;
+                borderRadiusAnim.update(6f);
+            }
+            case MINE -> {
+                String statusText = mineType.isEmpty() ? "Шахта" : mineType;
+                String timerText = mineTimeText.isEmpty() ? "0:00" : mineTimeText;
+
+                // TODO уменьшение островка для шахты (правая часть)
+                float timeWidth = Fonts.MEDIUM.getFont(6).width(timerText);
+                float textWidth = Fonts.MEDIUM.getFont(7).width(statusText);
+                widthTarget = 19.0f + textWidth + timeWidth;   // TODO воу вот это да, сделали отдельно для шахты чтобы было красиво
+
+                targetDisplayText = statusText;
+                borderRadiusAnim.update(6f);
+            }
+            case MUSIC -> {
+                String fullTrack = trackName + (artistsText != null && !artistsText.isEmpty() ? " - " + artistsText : "");
+                targetDisplayText = fullTrack;
+                float compactWidth = Math.min(32.0f + textFont.width(trackName), 100.0f);
+                widthTarget = extended ? 164f : Math.max(48f, compactWidth);
+                heightTarget = extended ? (showLyrics ? 125f : 80f) : 15f;
+                borderRadiusAnim.update(7f + 11f * extendingAnim.getValue());
+            }
+            default -> {
+                targetDisplayText = "Rockstar"; // TODO тут изменять если надо, правая сторона
+                widthTarget = 22f + textFont.width("Rockstar");
+                borderRadiusAnim.update(6f);
+            }
+        }
+
+        widthAnim.update(widthTarget);
+        heightAnim.update(heightTarget);
+
+        if (!currentDisplayText.equals(targetDisplayText)) {
+            startTextTransition(currentDisplayText, targetDisplayText);
+        }
+
+        boolean hasActiveMusic = activeStatus == StatusType.MUSIC;
+        if (hasActiveMusic && barUpdateTimer.finished(100)) {
+            updateBarHeights();
+            barUpdateTimer.reset();
+        }
+        barAnim.update(hasActiveMusic ? 1 : 0);
+    }
+
+    private StatusType resolveActiveStatus(boolean notification, boolean pvp, boolean blink, boolean event, boolean mine, boolean music) {
+        if (notification) return StatusType.NOTIFICATION;
+        if (pvp) return StatusType.PVP;
+        if (blink) return StatusType.BLINK;
+        if (event) return StatusType.EVENT;
+        if (mine) return StatusType.MINE;
+        if (music) return StatusType.MUSIC;
+        return StatusType.DEFAULT;
+    }
+
+    private boolean canShowMusicStatus() {
+        return trackName != null && !trackName.isEmpty() && activeSession != null;
+    }
+
+    private float computeTimerStatusWidth(String text, String timeText) {
+        float timeWidth = Fonts.MEDIUM.getFont(6).width(timeText);
+        float textWidth = Fonts.MEDIUM.getFont(7).width(text);
+        return 22f + textWidth + timeWidth;
+    }
+
+    // TODO не полный скид, скорее затычка, надо будет анимку пофиксить и будет вам полный скид (просмотрено 23.02)
+    private boolean updateBlinkData() {
+        Blink blink = Blink.INSTANCE;
+        if (blink == null || !blink.isEnabled()) {
+            blinkTimeText = "";
+            blinkPulse = false;
+            blinkProgress = 0f;
+            return false;
+        }
+        blinkPulse = blink.getPulse().isEnabled();
+        if (!blinkPulse) {
+            float seconds = blink.getTimer().getElapsedTime() / 1000f;
+            blinkTimeText = formatSeconds(seconds) + " сек";
+            blinkProgress = 0f;
+        } else {
+            float total = blink.getTime().getCurrent() * 50f;
+            float remaining = Math.max(0f, total - blink.getTimer().getElapsedTime());
+            float blinkWidth = 80.0f - Fonts.MEDIUM.getFont(7).width("Blink") - 14.0f;
+            blinkProgress = Math.max(0f, Math.min(blinkWidth, blinkWidth * (remaining / total)));
+            blinkTimeText = "";
+        }
+        return true;
+    }
+
+    private boolean updateEventData() {
+        if (mc == null || mc.world == null || ServerHelper.INSTANCE == null) {
+            eventText = "";
+            eventTimeText = "";
+            return false;
+        }
+
+        List<ServerHelper.ServerEvent> events = ServerHelper.INSTANCE.getServerEvents();
+        if (events.isEmpty()) {
+            eventText = "";
+            eventTimeText = "";
+            return false;
+        }
+
+        long now = System.currentTimeMillis();
+        ServerHelper.ServerEvent active = null;
+        for (ServerHelper.ServerEvent event : events) {
+            if ((long) event.timeEnd() > now) {
+                active = event;
+                break;
+            }
+        }
+        if (active == null) {
+            eventText = "";
+            eventTimeText = "";
+            return false;
+        }
+
+        long timeOpenMs = (long) active.timeOpen();
+        long timeEndMs = (long) active.timeEnd();
+        long remainingMs = timeOpenMs > now ? timeOpenMs - now : timeEndMs - now;
+
+        int totalSeconds = Math.max(0, (int) (remainingMs / 1000L));
+        int min = totalSeconds / 60;
+        int sec = totalSeconds % 60;
+
+        eventTimeText = String.format("%d:%02d", min, sec);
+        eventText = active.name();
+        eventColor = getEventColor(eventText);
+        return true;
+    }
+
+    // TODO на сколько знаю на хв шахты не определяются
+    private boolean updateMineData() {
+        if (mc == null || mc.world == null || mc.player == null) {
+            mineType = "";
+            mineTimeText = "";
+            return false;
+        }
+
+        Vec3d center = Zenith.getInstance().getServerHandler().isHolyWorld()
+                ? new Vec3d(23.0, 41.0, -156.0)
+                : new Vec3d(-52.0, 87.0, 3.0);
+
+        String time = "";
+        String type = "";
+        List<String> hwTypes = List.of("обычная", "редкая", "эпическая", "легендарная", "мифическая");
+
+        List<ArmorStandEntity> nearbyStands = new ArrayList<>();
+        for (Entity entity : mc.world.getEntities()) {
+            if (entity instanceof ArmorStandEntity armorStand && nearArmorStand(armorStand, center))
+                nearbyStands.add(armorStand);
+        }
+
+        nearbyStands.sort((a, b) -> Double.compare(b.getY(), a.getY()));
+
+        for (int i = 0; i < nearbyStands.size(); i++) {
+            ArmorStandEntity armorStand = nearbyStands.get(i);
+            Text customName = armorStand.getCustomName();
+            if (customName == null) continue;
+
+            String name = customName.getString().trim();
+            if (name.matches("\\d{1,2}:\\d{2}")) {
+                time = name.replaceFirst("^0", "");
+            } else if (name.contains("осталось:")) {
+                int index = name.indexOf(':');
+                if (index != -1 && index + 2 < name.length()) {
+                    String timeStr = name.substring(index + 1).trim();
+                    int minIndex = timeStr.indexOf(" мин.");
+                    int secIndex = timeStr.indexOf(" сек.");
+                    if (minIndex != -1 && secIndex != -1) {
+                        int min = Integer.parseInt(timeStr.substring(0, minIndex).trim());
+                        int sec = Integer.parseInt(timeStr.substring(minIndex + 5, secIndex).trim());
+                        time = String.format("%d:%02d", min, sec);
+                    }
+                }
+            } else if (name.startsWith("Следующая:")) {
+                int index = name.indexOf(':');
+                if (index != -1 && index + 2 < name.length())
+                    type = name.substring(index + 1).trim();
+            } else if (name.equals("Следующая шахта:") && i + 1 < nearbyStands.size()) {
+                ArmorStandEntity nextStand = nearbyStands.get(i + 1);
+                Text nextName = nextStand.getCustomName();
+                if (nextName != null) {
+                    String nextNameStr = nextName.getString().trim();
+                    if (hwTypes.contains(nextNameStr.toLowerCase().trim()))
+                        type = nextNameStr;
+                }
+            }
+
+            if (!time.isEmpty() && !type.isEmpty()) break;
+        }
+
+        if (time.isEmpty() || type.isEmpty()) {
+            mineType = "";
+            mineTimeText = "";
+            return false;
+        }
+
+        mineType = type;
+        mineTimeText = time;
+        mineColor = getMineColor(type);
+        return true;
+    }
+
+    private boolean nearArmorStand(ArmorStandEntity a, Vec3d v) {
+        return Math.abs(a.getX() - v.x) <= 2.0
+                && Math.abs(a.getY() - v.y) <= 2.0
+                && Math.abs(a.getZ() - v.z) <= 2.0;
+    }
+
+    private ColorRGBA getEventColor(String name) {
+        String lower = name.toLowerCase();
+        if (lower.contains("алтар")) return new ColorRGBA(138, 43, 226, 255);
+        if (lower.contains("маяк")) return new ColorRGBA(255, 69, 0, 255);
+        if (lower.contains("остров")) return new ColorRGBA(255, 69, 0, 255);
+        if (lower.contains("вулкан")) return new ColorRGBA(255, 140, 0, 255);
+        if (lower.contains("метеор")) return new ColorRGBA(70, 130, 180, 255);
+        if (lower.contains("посыл")) return new ColorRGBA(243, 196, 82, 255);
+        if (lower.contains("босс")) return new ColorRGBA(139, 222, 221, 255);
+        if (lower.contains("контейнер")) return new ColorRGBA(141, 99, 184, 255);
+        if (lower.contains("груз")) return new ColorRGBA(41, 253, 5, 255);
+        if (lower.contains("корабл")) return new ColorRGBA(90, 158, 152, 255);
+        return Colors.getAccentColor();
+    }
+
+    // TODO на сколько знаю на хв шахты не определяются
+    private ColorRGBA getMineColor(String type) {
+        String lower = type.trim().toLowerCase();
+        if (Zenith.getInstance().getServerHandler().isHolyWorld()) {
+            return switch (lower) {
+                case "легендарная" -> new ColorRGBA(0, 128, 250, 255);
+                case "эпическая" -> new ColorRGBA(231, 0, 250, 255);
+                default -> new ColorRGBA(243, 151, 250, 255);
+            };
+        }
+        return switch (lower) {
+            case "легендарная" -> new ColorRGBA(84, 152, 152, 255);
+            case "мифическая" -> new ColorRGBA(252, 84, 252, 255);
+            default -> new ColorRGBA(252, 168, 0, 255);
+        };
+    }
+
+    private String formatSeconds(float seconds) {
+        if (seconds < 10f) return String.format("%.1f", seconds);
+        return String.format("%.0f", seconds);
+    }
+
+    private void startTextTransition(String fromText, String toText) {
+        if (fromText.equals(toText) || isTextTransitioning) return;
+        previousText = fromText;
+        currentDisplayText = toText;
+        textTransitionProgress = 0f;
+        isTextTransitioning = true;
+    }
+
+    private void updateModuleNotifications() {
+        if (moduleNotifications.isEmpty()) return;
+        while (!moduleNotifications.isEmpty() && moduleNotifications.peekFirst().timer.finished(MODULE_NOTIFICATION_DURATION))
+            moduleNotifications.removeFirst();
+    }
+
+    private ModuleToggleNotification getActiveModuleNotification() {
+        return moduleNotifications.peekLast();
+    }
+
+    private String sanitizeModuleNotificationText(String raw) {
+        if (raw == null) return "";
+        String compact = raw.replace('\n', ' ').replace('\r', ' ').trim();
+        if (compact.length() > 34) return compact.substring(0, 31) + "...";
+        return compact;
+    }
+
+    private String makeGender(String parent) {
+        if (parent == null || parent.isEmpty()) return "";
+        String lower = parent.toLowerCase(Locale.ROOT);
+        if (lower.endsWith("а") || lower.endsWith("a") || lower.endsWith("я")) return "а";
+        if (lower.endsWith("ы") || lower.endsWith("и")) return "ы";
+        if (lower.endsWith("y") || lower.endsWith("ю") || lower.endsWith("u")) return "о";
+        return "";
+    }
+
+    // TODO уведомления как в крякнутом рокстаре, новые сами сделаете
+    public void showModuleNotification(String moduleName, boolean enabled) {
+        String cleanName = sanitizeModuleNotificationText(moduleName);
+        currentModuleEnabled = enabled;
+        String state = enabled ? "включен" : "выключен";
+        currentModuleNotification = cleanName + " " + state + makeGender(cleanName);
+        currentModuleNotificationClean = currentModuleNotification;
+        moduleNotifications.addLast(new ModuleToggleNotification(currentModuleNotificationClean, enabled));
+        while (moduleNotifications.size() > 6) moduleNotifications.removeFirst();
+        moduleNotificationTimer.reset();
+    }
+
+    private void updateBarHeights() {
+        for (int i = 0; i < 3; i++) {
+            targetBarHeights[i] = 4 + (float) Math.random() * 8;
+        }
+    }
+
+    private void clearData() {
+        trackName = null;
+        artistsText = null;
+        currentTimeMs = 0;
+        totalTimeMs = 1;
+        isPlaying = false;
+        activeSession = null;
+
+        timedLyrics.clear();
+        lyricsSynced = false;
+        lyricsScrollIndex = 0;
+
+        lastTrackId = "";
+        mediaColor = ColorRGBA.WHITE;
+        showLyrics = false;
+        currentLyricsUrl = "";
+        clearCoverTexture();
+
+        currentLyricIndex = -1;
+        targetLyricIndex = -1;
+        oldLyricIndex = -1;
+        lyricsAnimating = false;
+        lyricsCurrentShift = 0f;
+        lyricsWindowBaseIndex = -1;
+    }
+
+    /**
+     * Асинхронная загрузка лирики через LyricsFetcher.
+     * После получения парсим и проверяем валидность (количество строк, покрытие таймингами).
+     */
+    private void fetchLyricsAsync(String artist, String title, String trackId, long durationMs) {
+        if (lyricsPolling.compareAndSet(false, true)) {
+            lyricsExecutor.execute(() -> {
+                LyricsFetcher.LyricsResult result = LyricsFetcher.fetchFromGeniusWithUrl(artist, title);
+                final String fetched = result != null ? result.text() : null;
+                final String url = result != null ? result.url() : "";
+
+                final ParsedLyrics parsed = parseLyricsFull(fetched);
+
+                if (mc != null) {
+                    mc.execute(() -> {
+                        if (trackId.equals(lastTrackId)) {
+                            timedLyrics = parsed.lines;
+
+                            boolean synced = parsed.synced;
+
+                            // Проверяем покрытие таймингами (если synced)
+                            if (synced && durationMs > 0 && !timedLyrics.isEmpty()) {
+                                long lastTs = timedLyrics.get(timedLyrics.size() - 1).timeMs;
+                                float coverage = Math.min(1f, (float) lastTs / (float) durationMs);
+
+                                if (coverage < MIN_SYNC_COVERAGE) {
+                                    if (BAD_SYNC_FALLBACK_TO_UNSYNCED) {
+                                        synced = false; // покажем как unsynced (со скроллом)
+                                    } else {
+                                        timedLyrics = new ArrayList<>();
+                                        synced = false;
+                                    }
+                                }
+                            }
+
+                            lyricsSynced = synced;
+                            lyricsScrollIndex = 0;
+
+                            currentLyricIndex = -1;
+                            targetLyricIndex = -1;
+                            oldLyricIndex = -1;
+                            lyricsAnimating = false;
+                            lyricsCurrentShift = 0f;
+                            lyricsWindowBaseIndex = -1;
+
+                            showLyrics = !timedLyrics.isEmpty();
+                            currentLyricsUrl = url;
+
+                            saveLyricsToJson(trackId, title, artist, fetched, timedLyrics, url);
+                        }
+                        lyricsPolling.set(false);
+                    });
+                } else {
+                    lyricsPolling.set(false);
+                }
+            });
+        }
+    }
+
+    // -------------------------
+    // ЛИРИКА: парсим и сохраняем "synced/unsynced"
+    // -------------------------
+    private static class ParsedLyrics {
+        final List<LyricLine> lines;
+        final boolean synced;
+        ParsedLyrics(List<LyricLine> lines, boolean synced) {
+            this.lines = lines;
+            this.synced = synced;
+        }
+    }
+
+    /**
+     * Парсит сырой текст лирики.
+     * Если есть хотя бы одна строка с таймкодом и хотя бы одна без таймкода (после таймкодов) —
+     * весь текст считается несинхронным (unsynced), порядок строк сохраняется, таймкоды обнуляются.
+     * Если все строки имеют таймкоды — синхронная, сортируем по времени.
+     * Если ни одной строки с таймкодом — несинхронная.
+     */
+    private ParsedLyrics parseLyricsFull(String raw) {
+        if (raw == null || raw.isEmpty()) return new ParsedLyrics(new ArrayList<>(), false);
+
+        // Проверка минимального количества непустых строк
+        int nonEmpty = 0;
+        for (String l : raw.split("\\n")) {
+            if (!l.trim().isEmpty()) nonEmpty++;
+        }
+        if (nonEmpty < MIN_LYRIC_LINES) {
+            return new ParsedLyrics(new ArrayList<>(), false);
+        }
+
+        Pattern timePattern = Pattern.compile("\\[(\\d{2}):(\\d{2})\\.(\\d{2})\\]");
+        String[] lines = raw.split("\\n");
+
+        List<LyricLine> result = new ArrayList<>();
+        boolean hasTimestampLine = false;
+        boolean hasUntimedLineAfterTimestamp = false;
+        boolean timestampSeen = false;
+
+        for (String line : lines) {
+            Matcher m = timePattern.matcher(line);
+            if (m.find()) {
+                timestampSeen = true;
+                hasTimestampLine = true;
+                int minutes = Integer.parseInt(m.group(1));
+                int seconds = Integer.parseInt(m.group(2));
+                int millis = Integer.parseInt(m.group(3));
+                long timeMs = (minutes * 60L + seconds) * 1000L + millis * 10L;
+                String text = line.substring(m.end()).trim();
+                if (!text.isEmpty()) {
+                    result.add(new LyricLine(timeMs, text));
+                }
+            } else {
+                // Строка без таймкода
+                String trimmed = line.trim();
+                if (!trimmed.isEmpty()) {
+                    if (timestampSeen) {
+                        // Если уже были таймкоды и теперь встретилась строка без — помечаем как смешанный случай
+                        hasUntimedLineAfterTimestamp = true;
+                    }
+                    result.add(new LyricLine(0L, trimmed));
+                }
+            }
+        }
+
+        if (result.isEmpty()) return new ParsedLyrics(new ArrayList<>(), false);
+
+        // Случай 1: нет ни одной строки с таймкодом -> unsynced
+        if (!hasTimestampLine) {
+            return new ParsedLyrics(result, false);
+        }
+
+        // Случай 2: есть строки с таймкодами И есть строки без таймкодов после таймкодов -> unsynced (сохраняем порядок)
+        if (hasUntimedLineAfterTimestamp) {
+            // Обнуляем все таймкоды, чтобы не синхронизировать
+            for (LyricLine ll : result) {
+                ll.timeMs = 0L;
+            }
+            return new ParsedLyrics(result, false);
+        }
+
+        // Случай 3: все строки имеют таймкоды -> синхронная лирика
+        result.sort(Comparator.comparingLong(a -> a.timeMs));
+        return new ParsedLyrics(result, true);
+    }
+
+    private String truncateToWidth(String text, float maxWidth, Font font) {
+        if (font.width(text) <= maxWidth) return text;
+        String ellipsis = "...";
+        float ellipsisWidth = font.width(ellipsis);
+        for (int i = text.length(); i >= 0; i--) {
+            String sub = text.substring(0, i);
+            if (font.width(sub) + ellipsisWidth <= maxWidth) {
+                return sub + ellipsis;
+            }
+        }
+        return text;
+    }
+
+    private String getPvpTimer() { // TODO кстати, на сколько знаю везде работает, ни разу не замечал проблем с этим
+        if (mc.inGameHud == null || mc.inGameHud.getBossBarHud() == null) return "30";
+        for (ClientBossBar bossBar : mc.inGameHud.getBossBarHud().bossBars.values()) {
+            String name = bossBar.getName().getString().toLowerCase();
+            if (name.contains("pvp") || name.contains("пвп")) {
+                Matcher matcher = PVP_TIMER_PATTERN.matcher(bossBar.getName().getString());
+                if (matcher.find()) return matcher.group(1);
+            }
+        }
+        return "30";
+    }
+
+    private int getPvpTimerSeconds() {
+        try { return Integer.parseInt(getPvpTimer()); }
+        catch (NumberFormatException e) { return 30; }
+    }
+
+    /**
+     * Обновление плавных анимаций (бары, переход текста, play/pause, артист, HUD).
+     */
+    private void updateSmoothAnimations() {
+        long currentTime = System.currentTimeMillis();
+        if (lastRenderTime > 0) {
+            deltaTime = (currentTime - lastRenderTime) / 1000f;
+            deltaTime = Math.min(deltaTime, 0.033f);
+        }
+        lastRenderTime = currentTime;
+
+        for (int i = 0; i < 3; i++) {
+            currentBarHeights[i] = lerp(currentBarHeights[i], targetBarHeights[i], 8f * deltaTime);
+        }
+
+        if (isTextTransitioning) {
+            textTransitionProgress += 4f * deltaTime;
+            if (textTransitionProgress >= 1f) {
+                textTransitionProgress = 1f;
+                isTextTransitioning = false;
+                previousText = "";
+            }
+        }
+
+        pausingAnim.update(isPlaying ? 1.0f : 0.0f);
+
+        // Артист: быстро показываем только в расширенном режиме
+        boolean wantArtist = (activeStatus == StatusType.MUSIC && extended);
+        artistAlphaAnim.update(wantArtist ? 1f : 0f);
+
+        // HUD (время/инет): при расширении уходит "обратно"
+        boolean hideHud = (activeStatus == StatusType.MUSIC && extended);
+        hudAlphaAnim.update(hideHud ? 0f : 1f);
+        hudSlideAnim.update(hideHud ? 1f : 0f);
+    }
+
+    private float lerp(float a, float b, float t) {
+        if (t > 1) t = 1;
+        if (t < 0) t = 0;
+        return a + (b - a) * t;
+    }
+
+    /**
+     * Основной метод отрисовки компонента.
+     */
+    @Override
+    public void render(CustomDrawContext ctx) {
+        if (mc == null) return;
+
+        if (mediaPollTimer.finished(200)) {
+            updateMediaInfo();
+            mediaPollTimer.reset();
+        }
+
+        Theme theme = Zenith.getInstance().getThemeManager().getCurrentTheme();
+        checkBossBars();
+        updateAnimations();
+        updateSmoothAnimations();
+
+        float padding = isPvpModeActive ? 3f : 4f;
+        boolean mainMenu = mc.currentScreen instanceof CustomTitleScreen;
+
+        float currentWidth = (float) widthAnim.getValue();
+        float currentHeight = (float) heightAnim.getValue();
+        float currentBorderRadius = activeStatus == StatusType.MUSIC
+                ? 7.0f + 11.0f * extendingAnim.getValue()
+                : (float) borderRadiusAnim.getValue();
+
+        float defaultAlpha = (float) defaultStateAnim.getValue();
+        float mediaAlpha = (float) mediaStateAnim.getValue();
+        float pvpAlpha = (float) pvpStateAnim.getValue();
+        float notificationAlpha = (float) notificationStateAnim.getValue();
+        float blinkAlpha = (float) blinkStateAnim.getValue();
+        float eventAlpha = (float) eventStateAnim.getValue();
+        float mineAlpha = (float) mineStateAnim.getValue();
+        float barAlpha = (float) barAnim.getValue();
+
+        float x = mc.getWindow().getScaledWidth() / 2f - currentWidth / 2f;
+        float y = 7f;
+        if (hasNonPvpBossBars && !isPvpModeActive) y += 19;
+
+        this.x = x;
+        this.y = y;
+        this.width = currentWidth;
+        this.height = currentHeight;
+
+        ctx.pushMatrix();
+        {
+            ColorRGBA blurColor = ColorRGBA.BLACK.mulAlpha(1f);
+            DrawUtil.drawBlurHudFixed(ctx.getMatrices(), x - 1, y - 0.5f, currentWidth + 2, currentHeight + 1,
+                    21, BorderRadius.all(currentBorderRadius), blurColor);
+
+            ColorRGBA islandBg = theme.getBackgroundColor().withAlpha(220);
+            if (activeStatus == StatusType.MUSIC) islandBg = islandBg.mix(mediaColor, 0.2f);
+
+            drawRoundedRectForced(ctx, x - 1, y - 0.5f, currentWidth + 2, currentHeight + 1,
+                    BorderRadius.all(currentBorderRadius), islandBg);
+
+            if (liquidGlassAnimation.getValue() <= 0.01f) {
+                drawRightClickGlint(ctx, x - 1f, y - 0.5f, currentWidth + 2f, currentHeight + 1f, currentBorderRadius);
+            }
+
+            ctx.enableScissor((int) (x - 1), (int) (y - 1), (int) (x + currentWidth + 1), (int) (y + currentHeight + 1));
+            if (defaultAlpha > 0.01f) drawDefaultStatus(ctx, x, y, defaultStateAnim.getValue());
+            if (mineAlpha > 0.01f) {
+                String text = mineType.isEmpty() ? "Шахта" : mineType;
+                String timeText = mineTimeText.isEmpty() ? "0:00" : mineTimeText;
+                drawTimerStatus(ctx, x, y, text, timeText, mineColor, mineStateAnim.getValue());
+            }
+            if (eventAlpha > 0.01f) {
+                String text = eventText.isEmpty() ? "Событие" : eventText;
+                String timeText = eventTimeText.isEmpty() ? "0:00" : eventTimeText;
+                drawTimerStatus(ctx, x, y, text, timeText, eventColor, eventStateAnim.getValue());
+            }
+            if (blinkAlpha > 0.01f) drawBlinkStatus(ctx, x, y, blinkStateAnim.getValue());
+            if (pvpAlpha > 0.01f) {
+                drawPvpStatus(ctx, x, y, "Вы в PVP режиме", getPvpTimerSeconds(),
+                        new ColorRGBA(185, 28, 28, 255), pvpStateAnim.getValue());
+            }
+            if (notificationAlpha > 0.01f) drawNotificationStatus(ctx, x, y, notificationStateAnim.getValue());
+            if (mediaAlpha > 0.01f) drawMusicStatus(ctx, x, y, mediaStateAnim.getValue());
+            ctx.disableScissor();
+
+            if (!mainMenu) {
+                float hudA = hudAlphaAnim.getValue();
+                float hudSlide = hudSlideAnim.getValue();
+
+                Font timeFont = Fonts.MEDIUM.getFont(7);
+                String currentTimeStr = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm"));
+                float timeX = x - 1 - (padding * 3f) - timeFont.width(currentTimeStr) + 10.0f * hudSlide;
+                float timeYOffset = isPvpModeActive ? 5.0f : 3.0f;
+
+                ColorRGBA hudElementColor = resolveAdaptiveHudElementColor(theme, x, y).mulAlpha(hudA);
+
+                ctx.drawText(timeFont, currentTimeStr,
+                        timeX,
+                        y + timeYOffset - (padding / 4f) + (timeFont.height() / 2f),
+                        hudElementColor);
+
+                renderInternetStatus(ctx, theme,
+                        x + 8.0f * hudSlide,
+                        y,
+                        currentWidth,
+                        currentHeight,
+                        padding,
+                        barAlpha * hudA,
+                        hudElementColor);
+            }
+
+            settingsPanelAnimation.update(settingsPanelOpen);
+            if (settingsPanelAnimation.getValue() > 0f) drawSettingsPanel(ctx, theme);
+        }
+        ctx.popMatrix();
+    }
+
+    private void drawRoundedRectForced(CustomDrawContext ctx, float x, float y, float width, float height, BorderRadius borderRadius, ColorRGBA color) {
+        boolean prevSuppress = DrawUtil.isSuppressHudFill();
+        DrawUtil.setSuppressHudFill(false);
+        try { ctx.drawRoundedRect(x, y, width, height, borderRadius, color); }
+        finally { DrawUtil.setSuppressHudFill(prevSuppress); }
+    }
+
+    private void drawRoundedRectForced(CustomDrawContext ctx, float x, float y, float width, float height, BorderRadius borderRadius, Gradient gradient) {
+        boolean prevSuppress = DrawUtil.isSuppressHudFill();
+        DrawUtil.setSuppressHudFill(false);
+        try { ctx.drawRoundedRect(x, y, width, height, borderRadius, gradient); }
+        finally { DrawUtil.setSuppressHudFill(prevSuppress); }
+    }
+
+    private void drawInternetBarForced(CustomDrawContext ctx, float x, float y, float width, float height, ColorRGBA color) {
+        drawRoundedRectForced(ctx, x, y, width, height, BorderRadius.all(1f), color);
+    }
+
+    // TODO деф статус, специально для вас сделал "Rockstar" если кому-то надо будет в кряк перенести
+    private void drawDefaultStatus(CustomDrawContext ctx, float x, float y, float anim) {
+        Font font = Fonts.MEDIUM.getFont(7);
+        ColorRGBA iconColor = new ColorRGBA(115, 0, 255, 255).mulAlpha(anim);
+        drawRoundedRectForced(ctx, x - 6.0f + 10.0f * anim, y + 4.0f, 7.0f, 7.0f, BorderRadius.all(3.0f), iconColor);
+        ctx.drawText(font, "Rockstar", x + 25.0f - 10.0f * anim, y + 5.0f, Colors.getTextColor().mulAlpha(anim));
+    }
+
+    // TODO уведомления как в крякнутом рокстаре, новые сами сделаете
+    private void drawNotificationStatus(CustomDrawContext ctx, float x, float y, float anim) {
+        ModuleToggleNotification active = getActiveModuleNotification();
+        if (active == null) return;
+        Font font = Fonts.MEDIUM.getFont(7);
+
+        for (ModuleToggleNotification notification : moduleNotifications) {
+            notification.showing.update(notification == active);
+            float showValue = notification.showing.getValue();
+            if (showValue <= 0.01f) continue;
+
+            ColorRGBA dotColor = notification.enabled ? new ColorRGBA(55, 255, 55, 255) : new ColorRGBA(255, 25, 25, 255);
+            float offset = 10.0f * anim * showValue;
+
+            drawRoundedRectForced(ctx, x - 6.0f + offset, y + 4.0f, 7.0f, 7.0f, BorderRadius.all(3.0f), dotColor.mulAlpha(showValue));
+            ctx.drawText(font, notification.text, x + 25.0f - offset, y + 5.0f, Colors.getTextColor().mulAlpha(showValue));
+        }
+    }
+
+    // TODO не полный скид, скорее затычка, надо будет анимку пофиксить и будет вам полный скид (просмотрено 23.02)
+    private void drawBlinkStatus(CustomDrawContext ctx, float x, float y, float anim) {
+        Font font = Fonts.MEDIUM.getFont(7);
+        ctx.drawText(font, "Blink", x - 4.0f + 10.0f * anim, y + 5.0f, Colors.getTextColor().mulAlpha(anim));
+
+        if (!blinkPulse) {
+            String timeText = blinkTimeText.isEmpty() ? "0 сек" : blinkTimeText;
+            float textWidth = font.width(timeText);
+            float rightX = x + 80.0f + 4.0f - 10.0f * anim - textWidth;
+            ctx.drawText(font, timeText, rightX, y + 5.0f, Colors.getTextColor().mulAlpha(anim));
+            return;
+        }
+
+        float blinkWidth = 80.0f - font.width("Blink") - 14.0f;
+        float baseX = x + 80.0f - 5.0f - blinkWidth;
+
+        ctx.drawRoundedRect(baseX, y + 4.5f, blinkWidth, 6.0f, BorderRadius.all(2.5f),
+                Colors.getBackgroundColor().mulAlpha(0.4f * anim));
+
+        ctx.drawRoundedRect(x + 80.0f - 5.0f - blinkProgress, y + 4.5f, blinkProgress, 6.0f, BorderRadius.all(2.5f),
+                Colors.getAccentColor().mulAlpha(anim));
+    }
+
+    private void drawTimerStatus(CustomDrawContext ctx, float x, float y, String text, String timeText,
+                                 ColorRGBA color, float anim) {
+        Font timeFont = Fonts.MEDIUM.getFont(6);
+        Font textFont = Fonts.MEDIUM.getFont(7);
+        float timeWidth = timeFont.width(timeText);
+        float rectWidth = 5.5f + timeWidth;
+
+        drawRoundedRectForced(ctx, x - 16.0f + 20.0f * anim, y + 3.5f, rectWidth, 8.0f, BorderRadius.all(3.0f), // TODO эта строка отвечает за mine кружок
+                color.mulAlpha(anim));
+        ctx.drawText(timeFont, timeText, x - 13.0f + 20.0f * anim, y + 5.5f, ColorRGBA.WHITE.mulAlpha(anim)); // TODO эта строка отвечает за mine текст в кружке
+        // TODO строка ниже отвечает за mine текст
+        ctx.drawText(textFont, text, x + 23.0f - 10.0f * anim + timeWidth, y + 5f,
+                Colors.getTextColor().mulAlpha(anim));
+    }
+
+    private void drawPvpStatus(CustomDrawContext ctx, float x, float y, String text, int seconds,
+                               ColorRGBA color, float anim) {
+        Font timeFont = Fonts.MEDIUM.getFont(6);
+        Font textFont = Fonts.MEDIUM.getFont(7);
+
+        int safeSeconds = Math.max(0, seconds);
+        String suffix = "s";
+        float timeX = x - 13.0f + 20.0f * anim;
+        float timeY = y + 5.5f;
+
+        if (pvpTimeAnimation == null) {
+            pvpTimeAnimation = new AnimatedNumber(Fonts.MEDIUM.getFont(6), 5.0f, 500L, Easing.BAKEK);
+        }
+
+        pvpTimeAnimation.settings(true, ColorRGBA.WHITE);
+        pvpTimeAnimation.update(safeSeconds);
+
+        float timeWidth = pvpTimeAnimation.getWidth() + timeFont.width(suffix);
+        float rectWidth = 5.5f + timeWidth;
+
+        drawRoundedRectForced(ctx, x - 16.0f + 20.0f * anim, y + 3.5f, rectWidth, 8.0f, BorderRadius.all(3.0f), color.mulAlpha(anim));
+
+        pvpTimeAnimation.settings(true, ColorRGBA.WHITE.mulAlpha(anim));
+        pvpTimeAnimation.pos(timeX, timeY);
+        pvpTimeAnimation.render(ctx);
+
+        ctx.drawText(timeFont, suffix, timeX + pvpTimeAnimation.getWidth(), timeY, ColorRGBA.WHITE.mulAlpha(anim));
+        ctx.drawText(textFont, text, x + 23.0f - 10.0f * anim + timeWidth, y + 5.5f, Colors.getTextColor().mulAlpha(anim));
+    }
+
+    /**
+     * Отрисовка музыкального статуса (плеер, обложка, управление, лирика).
+     */
+    private void drawMusicStatus(CustomDrawContext ctx, float x, float y, float anim) {
+        if (!canShowMusicStatus() || activeSession == null) return;
+        MediaInfo media = activeSession.getMedia();
+        if (media == null) return;
+
+        float extending = extendingAnim.getValue();
+        float expWidth = 164.0f;          // TODO ширина развёрнутого плеера (было 164, щас хз)
+        float expHeight = showLyrics ? 125.0f : 80.0f;  // TODO высота с/без текста
+        float defaultWidth = 32.0f + Fonts.MEDIUM.getFont(7.0f).width(trackName);
+        ColorRGBA textColor = Colors.getTextColor().mulAlpha(anim);
+
+        float imageMargin = 4.0f + 6.0f * extending;    // TODO отступ картинки при развороте
+        float imageSize = 7.0f + 19.0f * extending;     // TODO размер обложки (мин/макс)
+        float imageY = y + (extended ? imageMargin : getMiddleOfBox(imageSize, this.height));
+        Identifier trackImage = coverTexture != null ? artwork : Zenith.id("icons/music/no_image.png");
+
+        DrawUtil.drawRoundedTexture(ctx.getMatrices(), trackImage, x + imageMargin - 10.0f + 10.0f * anim, imageY,
+                imageSize, imageSize, BorderRadius.all(1.0f + 5.0f * extending), ColorRGBA.WHITE.mulAlpha(anim));
+
+        float titleX = x - 5.0f + 10.0f * anim + 10.0f * anim + 29.0f * extending;
+
+        float waveStartX = x + zenith.zov.utility.math.MathUtil.interpolate(
+                Math.min(defaultWidth, 100f),
+                expWidth - 10.0f,
+                extending
+        ) - 20.0f;
+
+        float titleMaxWidth = waveStartX - titleX - 4.0f;
+        if (titleMaxWidth < 20.0f) titleMaxWidth = 20.0f;
+
+        float maxWidthCompact = 100.0f;
+        float fadeWidthTitle = extended ? (expWidth - 30.0f) : (maxWidthCompact + 5.0f);
+        fadeWidthTitle = Math.min(fadeWidthTitle, titleMaxWidth);
+
+        drawFadeoutText(
+                ctx,
+                Fonts.MEDIUM.getFont(7.0f),
+                media.getTitle(),
+                titleX,
+                y + 5.0f + 11.0f * extending,
+                textColor.mulAlpha(0.85f), // TODO альфа названия песни
+                fadeWidthTitle,
+                0.3f, 1.25f
+        );
+
+        if (extending > 0.0f) {
+            float fadeWidthArtist = extended ? (expWidth - 30.0f) : (maxWidthCompact + 5.0f);
+            fadeWidthArtist = Math.min(fadeWidthArtist, titleMaxWidth);
+
+            // Быстро гасим артиста + доп. гашение при нехватке места (чтобы не "налезал" на title)
+            float cramped = 1f;
+            if (fadeWidthArtist < 45f) cramped = clamp01((fadeWidthArtist - 20f) / 25f);
+            float artistA = artistAlphaAnim.getValue() * extending * (0.15f + 0.85f * cramped);
+
+            drawFadeoutText(
+                    ctx,
+                    Fonts.REGULAR.getFont(7.0f),
+                    media.getArtist(),
+                    x + 20.0f + 24.0f * extending,
+                    y + 5.0f + 19.0f * extending,
+                    textColor.mulAlpha(0.55f * artistA), // TODO альфа автора/артиста
+                    fadeWidthArtist,
+                    0.3f, 1.15f
+            );
+
+            // TODO Время и прогресс барчик
+            String currentTimeText = formatMediaTime(currentTimeMs / 1000);
+            String totalTimeText = formatMediaTime(totalTimeMs / 1000);
+
+            ctx.drawText(Fonts.REGULAR.getFont(5.0f), currentTimeText,
+                    mc.getWindow().getScaledWidth() / 2.0f - expWidth / 2.0f + 11.0f * extending,
+                    y + 43.0f * extending,
+                    textColor.mulAlpha(0.7f)); // TODO альфа времени песни (сколько прошло, например 1:05)
+
+            ctx.drawText(Fonts.REGULAR.getFont(5.0f), totalTimeText,
+                    mc.getWindow().getScaledWidth() / 2.0f + expWidth / 2.0f - (9.5f + Fonts.REGULAR.getFont(5.0f).width(totalTimeText) * extending),
+                    y + 43.0f * extending,
+                    textColor.mulAlpha(0.7f)); // TODO альфа времени песни (сколько всего идет)
+
+            float barWidth = 116.0f;   // TODO ширина прогресс-бара
+            float barX = mc.getWindow().getScaledWidth() / 2.0f - barWidth / 2.0f;
+            float barY = y + expHeight - (showLyrics ? 45.0f : 0.0f) - 36.5f * extending;
+
+            drawRoundedRectForced(ctx, barX, barY, barWidth, 3.0f, BorderRadius.all(0.5f), textColor.mulAlpha(0.25f)); // TODO пустая строка которая заполняется по мере... а поймешь крч
+            float safeDuration = Math.max(1.0f, (float) totalTimeMs);
+            float progressWidth = barWidth * Math.min(1.0f, (float) currentTimeMs / safeDuration);
+            drawRoundedRectForced(ctx, barX, barY, progressWidth, 3.0f, BorderRadius.all(0.5f), textColor.mulAlpha(0.6f)); // TODO сама строка белая которая заполняет пустую строку
+
+            if (extending > 0.7f) {
+                float controlY = y + expHeight - 25.0f * extending;
+                double mouseX = mc.mouse.getX() / mc.getWindow().getScaleFactor();
+                double mouseY = mc.mouse.getY() / mc.getWindow().getScaleFactor();
+
+                float buttonStartX = x + (expWidth - 16f * 3 - 16f) / 2f;
+                float previousX = buttonStartX;
+                float pauseX = previousX + 24f;
+                float nextX = pauseX + 24f;
+
+                zenith.zov.utility.render.display.base.Rect previous = new zenith.zov.utility.render.display.base.Rect(previousX, controlY, 16.0f, 16.0f);
+                zenith.zov.utility.render.display.base.Rect pause = new zenith.zov.utility.render.display.base.Rect(pauseX, controlY, 16.0f, 16.0f);
+                zenith.zov.utility.render.display.base.Rect next = new zenith.zov.utility.render.display.base.Rect(nextX, controlY, 16.0f, 16.0f);
+
+                hoverPrevious.update(previous.contains(mouseX, mouseY));
+                hoverPause.update(pause.contains(mouseX, mouseY));
+                hoverNext.update(next.contains(mouseX, mouseY));
+
+                // anti-pixel: включаем linear filtering (с ассетами 32x32 будет заметно лучше)
+                setLinearTextureFiltering(true);
+
+                ctx.drawTexture(Zenith.id("icons/music/previous.png"), previous.x(), previous.y(), previous.width(), previous.height(),
+                        textColor.mulAlpha(1.0f - 0.4f * hoverPrevious.getValue()));
+
+                float pauseAnim = pausingAnim.getValue();
+                float centerX = pause.x() + pause.width() / 2.0f;
+                float centerY = pause.y() + pause.height() / 2.0f;
+
+                drawRotatedScaledTexture(ctx, Zenith.id("icons/music/play.png"), pause.x(), pause.y(), pause.width(), pause.height(),
+                        centerX, centerY, 90.0f * pauseAnim, Math.max(0.001f, 1.0f - pauseAnim),
+                        textColor.mulAlpha((1.0f - pauseAnim) * (1.0f - 0.4f * hoverPause.getValue())));
+
+                drawRotatedScaledTexture(ctx, Zenith.id("icons/music/pause.png"), pause.x(), pause.y(), pause.width(), pause.height(),
+                        centerX, centerY, -90.0f + 90.0f * pauseAnim, Math.max(0.001f, pauseAnim),
+                        textColor.mulAlpha(pauseAnim * (1.0f - 0.4f * hoverPause.getValue())));
+
+                ctx.drawTexture(Zenith.id("icons/music/next.png"), next.x(), next.y(), next.width(), next.height(),
+                        textColor.mulAlpha(1.0f - 0.4f * hoverNext.getValue()));
+
+                setLinearTextureFiltering(false);
+            }
+
+            String ownerIcon = resolveOwnerIcon(activeSession.getOwner());
+            if (ownerIcon != null) {
+                ctx.drawTexture(Zenith.id("icons/media/" + ownerIcon + ".png"), x + expWidth - 22.0f, y + expHeight - 21.0f, 8.0f, 8.0f, ColorRGBA.WHITE.mulAlpha(anim));
+            }
+
+            // кнопка "lyrics" показывается если есть текст (synced или unsynced)
+            if (!timedLyrics.isEmpty()) {
+                zenith.zov.utility.render.display.base.Rect lyricsRect =
+                        new zenith.zov.utility.render.display.base.Rect(x + 14.0f, y + expHeight - 21.0f, 8.0f, 8.0f);
+
+                double mouseX = mc.mouse.getX() / mc.getWindow().getScaleFactor();
+                double mouseY = mc.mouse.getY() / mc.getWindow().getScaleFactor();
+                hoverLyrics.update(lyricsRect.contains(mouseX, mouseY));
+
+                setLinearTextureFiltering(true);
+                ctx.drawTexture(Zenith.id("icons/music/text.png"), lyricsRect.x(), lyricsRect.y(), lyricsRect.width(), lyricsRect.height(),
+                        textColor.mulAlpha(1.0f - 0.4f * hoverLyrics.getValue()));
+                setLinearTextureFiltering(false);
+            }
+
+            // ===== Лирика (текст песни) с вертикальным затенением =====
+            if (showLyrics && !timedLyrics.isEmpty()) {
+                float lyricAreaWidth = expWidth - 20.0f;
+                float baseY = y + 55.0f;
+                float areaTop = baseY - 1.0f;
+                float areaBottom = baseY + (6 * LYRIC_LINE_HEIGHT) + 1.0f;
+                float fadeZone = LYRIC_LINE_HEIGHT * 1.6f;
+
+                if (lyricsSynced) {
+                    int centerIndex = lyricsAnimating ? targetLyricIndex : currentLyricIndex;
+
+                    // Окно фиксируем на старом индексе во время анимации, чтобы не было дерганья
+                    int baseIndex = (lyricsAnimating && lyricsWindowBaseIndex != -1) ? lyricsWindowBaseIndex : centerIndex;
+
+                    int start = computeSyncedWindowStart(baseIndex, timedLyrics.size());
+                    int end = Math.min(timedLyrics.size(), start + 6);
+
+                    for (int i = start; i < end; i++) {
+                        String line = timedLyrics.get(i).text;
+
+                        // если centerIndex == -1 (еще не дошли до 1й строки) — не подсвечиваем
+                        boolean isActive = (centerIndex >= 0 && i == centerIndex);
+                        int diff = (centerIndex >= 0) ? Math.abs(i - centerIndex) : 999;
+
+                        ColorRGBA lineColor;
+                        if (isActive) lineColor = textColor;
+                        else if (diff == 1) lineColor = textColor.withAlpha(70);
+                        else lineColor = textColor.withAlpha(40);
+
+                        float yOffset = baseY + (i - start) * LYRIC_LINE_HEIGHT + lyricsCurrentShift;
+                        Font lyricFont = isActive ? Fonts.REGULAR.getFont(6.18f) : Fonts.REGULAR.getFont(5.5f);
+                        String truncated = truncateToWidth(line, lyricAreaWidth, lyricFont);
+
+                        float aMul = 1.0f;
+                        if (yOffset < areaTop + fadeZone) {
+                            float t = (yOffset - areaTop) / fadeZone;
+                            aMul = clamp01(t);
+                        } else if (yOffset > areaBottom - fadeZone) {
+                            float t = (areaBottom - yOffset) / fadeZone;
+                            aMul = clamp01(t);
+                        }
+                        aMul = 0.25f + 0.75f * aMul;
+
+                        ctx.drawText(lyricFont, truncated, x + 10.0f, yOffset, lineColor.mulAlpha(extending * aMul));
+                    }
+                } else {
+                    renderUnsyncedLyrics(ctx, x, y, expWidth, extending, textColor, areaTop, areaBottom, fadeZone);
+                }
+            }
+        }
+
+        // Волны (визуализация звука)
+        for (int i = 0; i < waveAnims.length; i++) {
+            float phase = (float) (currentTimeMs / 1000.0 * 8.0) + i * 0.7f;
+            float size = isPlaying ? (float) (2.0 + Math.abs(zenith.zov.utility.math.MathUtil.sin(phase)) * 8.0) : 3.0f;
+            waveAnims[i].update(size);
+
+            drawRoundedRectForced(ctx,
+                    x + zenith.zov.utility.math.MathUtil.interpolate(Math.min(defaultWidth, 100f), expWidth - 10.0f, extending)
+                            - 2.0f - 10.0f * anim + i * (2.0f + extending),
+                    y + zenith.zov.utility.math.MathUtil.interpolate(4.25, 14.0, extending) + (7.0f - waveAnims[i].getValue()) / 2.0f,
+                    1.0f + extending, waveAnims[i].getValue(),
+                    BorderRadius.all(0.5f),
+                    mediaColor.mulAlpha(anim));
+        }
+    }
+
+    private int computeSyncedWindowStart(int centerIndex, int totalLines) {
+        if (totalLines <= 6) return 0;
+        if (centerIndex < 0) return 0;
+        int start = centerIndex - 2;
+        int maxStart = totalLines - 6;
+        if (start < 0) start = 0;
+        if (start > maxStart) start = maxStart;
+        return start;
+    }
+
+    private void renderUnsyncedLyrics(CustomDrawContext ctx, float x, float y, float expWidth, float extending,
+                                      ColorRGBA textColor, float areaTop, float areaBottom, float fadeZone) {
+        float lyricAreaWidth = expWidth - 20.0f;
+        float baseY = y + 55.0f;
+
+        int maxStart = Math.max(0, timedLyrics.size() - UNSYNC_VISIBLE_LINES);
+        if (lyricsScrollIndex > maxStart) lyricsScrollIndex = maxStart;
+        if (lyricsScrollIndex < 0) lyricsScrollIndex = 0;
+
+        Font lyricFont = Fonts.REGULAR.getFont(UNSYNC_FONT_SIZE);
+        ColorRGBA baseColor = textColor.withAlpha(UNSYNC_ALPHA).mulAlpha(extending);
+
+        int start = lyricsScrollIndex;
+        int end = Math.min(timedLyrics.size(), start + UNSYNC_VISIBLE_LINES);
+
+        for (int i = start; i < end; i++) {
+            String line = timedLyrics.get(i).text;
+            String truncated = truncateToWidth(line, lyricAreaWidth, lyricFont);
+            float yOffset = baseY + (i - start) * LYRIC_LINE_HEIGHT;
+
+            float aMul = 1.0f;
+            if (yOffset < areaTop + fadeZone) {
+                float t = (yOffset - areaTop) / fadeZone;
+                aMul = clamp01(t);
+            } else if (yOffset > areaBottom - fadeZone) {
+                float t = (areaBottom - yOffset) / fadeZone;
+                aMul = clamp01(t);
+            }
+            aMul = 0.25f + 0.75f * aMul;
+
+            ctx.drawText(lyricFont, truncated, x + 10.0f, yOffset, baseColor.mulAlpha(aMul));
+        }
+    }
+
+    private float clamp01(float v) {
+        return Math.max(0f, Math.min(1f, v));
+    }
+
+    /**
+     * Обработка скролла мыши (для несинхронной лирики).
+     */
+    public boolean handleMouseScroll(double mouseX, double mouseY, double verticalAmount) {
+        if (!extended || activeStatus != StatusType.MUSIC) return false;
+        if (!showLyrics || timedLyrics.isEmpty()) return false;
+        if (lyricsSynced) return false;
+
+        if (!isMouseOver((float) mouseX, (float) mouseY)) return false;
+
+        int delta = verticalAmount > 0 ? -UNSYNC_SCROLL_STEP : UNSYNC_SCROLL_STEP;
+        lyricsScrollIndex += delta;
+
+        int maxStart = Math.max(0, timedLyrics.size() - UNSYNC_VISIBLE_LINES);
+        if (lyricsScrollIndex > maxStart) lyricsScrollIndex = maxStart;
+        if (lyricsScrollIndex < 0) lyricsScrollIndex = 0;
+
+        return true;
+    }
+
+    private void drawRotatedScaledTexture(CustomDrawContext ctx, Identifier id, float x, float y, float width, float height,
+                                          float centerX, float centerY, float degrees, float scale, ColorRGBA color) {
+        MatrixStack matrices = ctx.getMatrices();
+        matrices.push();
+        matrices.translate(centerX, centerY, 0.0f);
+        matrices.multiply(RotationAxis.POSITIVE_Z.rotationDegrees(degrees));
+        matrices.scale(scale, scale, 1.0f);
+        matrices.translate(-centerX, -centerY, 0.0f);
+        ctx.drawTexture(id, x, y, width, height, color);
+        matrices.pop();
+    }
+
+    private void drawFadeoutText(CustomDrawContext ctx, Font font, String text, float x, float y,
+                                 ColorRGBA color, float maxWidth, float fadeStart, float fadeEnd) {
+        if (text == null || text.isEmpty()) return;
+
+        float textWidth = font.width(text);
+        if (textWidth <= maxWidth) {
+            ctx.drawText(font, text, x, y, color);
+            return;
+        }
+
+        MsdfRenderer.renderText(
+                font.getFont(), text, font.getSize(), color.getRGB(),
+                ctx.getMatrices().peek().getPositionMatrix(), x, y, 0,
+                true, fadeStart, fadeEnd, maxWidth
+        );
+    }
+
+    private static float getMiddleOfBox(float size, float boxHeight) {
+        return (boxHeight - size) / 2.0f;
+    }
+
+    private static String resolveOwnerIcon(String ownerRaw) {
+        if (ownerRaw == null) return null;
+        String owner = ownerRaw.toLowerCase(Locale.ROOT);
+        if (owner.contains("yandex") || owner.contains("яндекс")) return "yandex_music";
+        if (owner.contains("edge")) return "edge";
+        if (owner.contains("spotify")) return "spotify";
+        return null;
+    }
+
+    private static String formatMediaTime(long totalSeconds) {
+        long safe = Math.max(0L, totalSeconds);
+        long minutes = safe / 60L;
+        long seconds = safe % 60L;
+        return String.format("%d:%02d", minutes, seconds);
+    }
+
+    private ColorRGBA resolveAdaptiveHudElementColor(Theme theme, float x, float y) {
+        if (viewMode != IslandViewMode.NEW) {
+            adaptiveHudColor = theme.getWhite();
+            adaptiveHudColorAnimation.setValue(1f);
+            return adaptiveHudColor;
+        }
+
+        if (adaptiveHudColorTimer.finished(500L)) {
+            float pixelX = mc.getWindow().getWidth() / 2.0f;
+            float pixelY = mc.getWindow().getHeight() - (y + 5.0f);
+            ColorRGBA pixel = ColorRGBA.fromPixel(pixelX, pixelY);
+            adaptiveUseDark = (pixel.getRed() + pixel.getGreen() + pixel.getBlue()) / 3.0f > 70.0f;
+            adaptiveHudColorTimer.reset();
+        }
+
+        adaptiveHudColorAnimation.update(adaptiveUseDark ? 0f : 1f);
+        adaptiveHudColor = ColorRGBA.lerp(ColorRGBA.BLACK, ColorRGBA.WHITE, adaptiveHudColorAnimation.getValue());
+        return adaptiveHudColor;
+    }
+
+    private void drawRightClickGlint(CustomDrawContext ctx, float x, float y, float width, float height, float borderRadius) {
+        float glint = rightClickGlintAnimation.update(1f);
+        if (settingsPanelOpen && glint >= 0.999f) {
+            rightClickGlintAnimation.setValue(0f);
+            glint = 0f;
+        }
+        if (!settingsPanelOpen && glint >= 0.999f) return;
+
+        float inv = 1.0f - glint;
+        float sweepWidth = Math.max(18f, width * 0.38f);
+        float travelStart = x;
+        float travelEnd = x + Math.max(0f, width - sweepWidth);
+        float currentX = travelStart + (travelEnd - travelStart) * glint;
+
+        float fillAlpha = 0.16f * inv;
+        float borderAlpha = 0.34f * inv;
+        float bandAlpha = 0.42f * inv;
+        float secondaryAlpha = 0.24f * inv;
+
+        float radius = Math.max(4f, borderRadius);
+        float bandRadius = Math.min(radius, Math.min(height, sweepWidth) * 0.5f);
+        float secondaryWidth = sweepWidth * 0.55f;
+        float secondaryRadius = Math.min(radius, Math.min(height, secondaryWidth) * 0.5f);
+
+        drawRoundedRectForced(ctx, x, y, width, height, BorderRadius.all(radius), ColorRGBA.WHITE.mulAlpha(fillAlpha));
+        ctx.drawRoundedBorder(x, y, width, height, 1.0f, BorderRadius.all(radius), ColorRGBA.WHITE.mulAlpha(borderAlpha));
+
+        drawRoundedRectForced(ctx, currentX, y, sweepWidth, height, BorderRadius.all(bandRadius),
+                Gradient.of(ColorRGBA.WHITE.mulAlpha(0f), ColorRGBA.WHITE.mulAlpha(bandAlpha * 0.25f),
+                        ColorRGBA.WHITE.mulAlpha(bandAlpha), ColorRGBA.WHITE.mulAlpha(0f)));
+
+        drawRoundedRectForced(ctx, currentX - sweepWidth * 0.45f, y, secondaryWidth, height, BorderRadius.all(secondaryRadius),
+                Gradient.of(ColorRGBA.WHITE.mulAlpha(0f), ColorRGBA.WHITE.mulAlpha(secondaryAlpha * 0.2f),
+                        ColorRGBA.WHITE.mulAlpha(secondaryAlpha), ColorRGBA.WHITE.mulAlpha(0f)));
+    }
+
+    private void renderInternetStatus(CustomDrawContext ctx, Theme theme, float x, float y, float width, float height,
+                                      float padding, float barAlpha, ColorRGBA elementColor) {
+        if (viewMode == IslandViewMode.NEW) {
+            boolean hasPingInfo = mc.player != null && !mc.isInSingleplayer() && mc.player.networkHandler != null
+                    && mc.player.networkHandler.getPlayerListEntry(mc.player.getUuid()) != null;
+
+            if (hasPingInfo) {
+                int ping = mc.player.networkHandler.getPlayerListEntry(mc.player.getUuid()).getLatency();
+                int[] pingThresholds = new int[]{450, 300, 150, 75};
+
+                float baseX = x + width + 8.5f;
+                float baseY = y + 8.0f;
+                float barWidth = 2.0f;
+                float gap = 0.7f;
+
+                for (int i = 0; i < 4; i++) {
+                    float barHeight = 3.0f + i;
+                    float barX = baseX + i * (barWidth + gap);
+                    float barY = baseY - i;
+                    drawInternetBarForced(ctx, barX, barY, barWidth, barHeight, elementColor.withAlpha(elementColor.getAlpha() * 0.2f));
+                }
+
+                for (int i = 0; i < 4; i++) {
+                    if (ping < pingThresholds[i]) {
+                        float barHeight = 3.0f + i;
+                        float barX = baseX + i * (barWidth + gap);
+                        float barY = baseY - i;
+                        drawInternetBarForced(ctx, barX, barY, barWidth, barHeight, elementColor);
+                    }
+                }
+            } else {
+                ctx.drawTexture(Zenith.id("icons/airplane.png"), x + width + 8.0f, y + 3.5f, 8.0f, 8.0f, elementColor);
+            }
+            return;
+        }
+
+        float baseBarY = y + padding + (Fonts.ICONS.getFont(7).height() / 2f) - 5 + 1;
+        float[] barYs = new float[3];
+        for (int i = 0; i < 3; i++) barYs[i] = baseBarY + (10 - currentBarHeights[i]) / 2f;
+
+        boolean hasActiveMusic = activeStatus == StatusType.MUSIC;
+        if (hasActiveMusic && barAlpha > 0.01f) {
+            ColorRGBA barColor = elementColor.mulAlpha(barAlpha);
+            drawInternetBarForced(ctx, x + width + (padding * 3f), barYs[0], 3.5f, currentBarHeights[0], barColor);
+            drawInternetBarForced(ctx, x + width + (padding * 3f) + 4, barYs[1], 3.5f, currentBarHeights[1], barColor);
+            drawInternetBarForced(ctx, x + width + (padding * 3f) + 8, barYs[2], 3.5f, currentBarHeights[2], barColor);
+        } else {
+            drawInternetBarForced(ctx, x + width + (padding * 3f), baseBarY, 3.5f, 10f, elementColor);
+            drawInternetBarForced(ctx, x + width + (padding * 3f) + 4, baseBarY + 2, 3.5f, 8f, elementColor);
+            drawInternetBarForced(ctx, x + width + (padding * 3f) + 8, baseBarY + 3.5f, 3.5f, 6.5f, elementColor);
+        }
+    }
+
+    /**
+     * Отрисовка панели настроек (по правому клику).
+     */
+    private void drawSettingsPanel(CustomDrawContext ctx, Theme theme) {
+        float panelWidth = 150f;
+        float itemHeight = 18f;
+        float padding = 8f;
+        float checkboxSize = 12f;
+        float animValue = settingsPanelAnimation.getValue();
+        float alpha = animValue;
+
+        settingsPanelX = this.x + this.width + 10f;
+        settingsPanelY = this.y;
+
+        ColorRGBA bgColor = theme.getBackgroundColor().mulAlpha(0.95f * alpha);
+        ColorRGBA borderColor = theme.getColor().mulAlpha(0.3f * alpha);
+        ColorRGBA dividerColor = theme.getColor().mulAlpha(0.15f * alpha);
+
+        ctx.getMatrices().push();
+        ctx.getMatrices().translate(settingsPanelX + panelWidth / 2f, settingsPanelY + 128f, 0f);
+        ctx.getMatrices().scale(animValue, animValue, 1f);
+        ctx.getMatrices().translate(-(settingsPanelX + panelWidth / 2f), -(settingsPanelY + 128f), 0f);
+
+        float liquidAnim = liquidGlassAnimation.getValue();
+        if (liquidAnim > 0.01f) {
+            DrawUtil.drawBlurHudFixed(ctx.getMatrices(), settingsPanelX, settingsPanelY, panelWidth, 256f, 21,
+                    BorderRadius.all(4f), ColorRGBA.WHITE.mulAlpha(liquidAnim));
+            DrawUtil.drawLiquidRect(ctx.getMatrices(), settingsPanelX, settingsPanelY, panelWidth, 256f,
+                    BorderRadius.all(4f), Interface.INSTANCE.getLiquidGlassColor().mulAlpha(liquidAnim),
+                    2.0f, 25.0f, 0.5f, 1.0f, true, 0.5f, 0.02f);
+        } else {
+            DrawUtil.drawBlurHudFixed(ctx.getMatrices(), settingsPanelX, settingsPanelY, panelWidth, 256f, 21,
+                    BorderRadius.all(4f), ColorRGBA.WHITE);
+        }
+
+        drawRoundedRectForced(ctx, settingsPanelX - 1, settingsPanelY - 1, panelWidth + 2, 256f + 2,
+                BorderRadius.all(5f), borderColor);
+        drawRoundedRectForced(ctx, settingsPanelX, settingsPanelY, panelWidth, 256f, BorderRadius.all(4f), bgColor);
+
+        if (animValue < 0.3f) {
+            ctx.getMatrices().pop();
+            return;
+        }
+        float contentAlpha = (animValue - 0.3f) / 0.7f;
+
+        String title = "Dynamic Island";
+        float titleWidth = Fonts.MEDIUM.getFont(9f).width(title);
+        ctx.drawText(Fonts.MEDIUM.getFont(9f), title,
+                settingsPanelX + (panelWidth - titleWidth) / 2f, settingsPanelY + padding,
+                theme.getWhite().mulAlpha(contentAlpha));
+
+        float currentY = settingsPanelY + padding + 14f;
+        drawRoundedRectForced(ctx, settingsPanelX + padding, currentY, panelWidth - padding * 2f, 1f,
+                BorderRadius.ZERO, dividerColor.mulAlpha(contentAlpha));
+        currentY += 4f;
+
+        drawSettingItem(ctx, theme, "Уведомления", showNotifications, settingsPanelX, currentY, // TODO вау, тут поменять можно
+                panelWidth, itemHeight, checkboxSize, padding, contentAlpha);
+        currentY += itemHeight;
+
+        drawSettingItem(ctx, theme, "PVP", showPvp, settingsPanelX, currentY,
+                panelWidth, itemHeight, checkboxSize, padding, contentAlpha);
+        currentY += itemHeight;
+
+        drawSettingItem(ctx, theme, "Blink", showBlink, settingsPanelX, currentY,
+                panelWidth, itemHeight, checkboxSize, padding, contentAlpha);
+        currentY += itemHeight;
+
+        drawSettingItem(ctx, theme, "Ивенты", showEvent, settingsPanelX, currentY,
+                panelWidth, itemHeight, checkboxSize, padding, contentAlpha);
+        currentY += itemHeight;
+
+        drawSettingItem(ctx, theme, "Шахта", showMine, settingsPanelX, currentY,
+                panelWidth, itemHeight, checkboxSize, padding, contentAlpha);
+        currentY += itemHeight;
+
+        drawSettingItem(ctx, theme, "New view", viewMode == IslandViewMode.NEW, settingsPanelX, currentY,
+                panelWidth, itemHeight, checkboxSize, padding, contentAlpha);
+        currentY += itemHeight;
+
+        drawSettingItem(ctx, theme, "Жидкое стекло", liquidGlassEnabled, settingsPanelX, currentY,
+                panelWidth, itemHeight, checkboxSize, padding, contentAlpha);
+
+        ctx.getMatrices().pop();
+    }
+
+    private void drawSettingItem(CustomDrawContext ctx, Theme theme, String label, boolean enabled,
+                                 float x, float y, float width, float height, float checkboxSize,
+                                 float padding, float alpha) {
+        ctx.drawText(Fonts.MEDIUM.getFont(9f), label,
+                x + padding, y + (height - 9f) / 2f, theme.getWhite().mulAlpha(0.8f * alpha));
+
+        float checkboxX = x + width - padding - checkboxSize;
+        float checkboxY = y + (height - checkboxSize) / 2f;
+
+        if (enabled) {
+            ColorRGBA checkboxBg = new ColorRGBA(80, 200, 120, (int) (255 * alpha));
+            ColorRGBA checkboxBorder = new ColorRGBA(60, 180, 100, (int) (255 * alpha));
+            drawRoundedRectForced(ctx, checkboxX - 0.5f, checkboxY - 0.5f, checkboxSize + 1f, checkboxSize + 1f,
+                    BorderRadius.all(3f), checkboxBorder);
+            drawRoundedRectForced(ctx, checkboxX, checkboxY, checkboxSize, checkboxSize,
+                    BorderRadius.all(2.5f), checkboxBg);
+        } else {
+            ColorRGBA checkboxBg = theme.getBackgroundColor().mulAlpha(0.6f * alpha);
+            ColorRGBA checkboxBorder = theme.getColor().mulAlpha(0.3f * alpha);
+            drawRoundedRectForced(ctx, checkboxX - 0.5f, checkboxY - 0.5f, checkboxSize + 1f, checkboxSize + 1f,
+                    BorderRadius.all(3f), checkboxBorder);
+            drawRoundedRectForced(ctx, checkboxX, checkboxY, checkboxSize, checkboxSize,
+                    BorderRadius.all(2.5f), checkboxBg);
+        }
+    }
+
+    private boolean handleSettingsClick(double mouseX, double mouseY) {
+        if (settingsPanelAnimation.getValue() < 0.9f) return false;
+        float panelWidth = 150f; // TODO и тут тоже
+        float itemHeight = 18f;
+        float padding = 8f;
+
+        if (mouseX < settingsPanelX || mouseX > settingsPanelX + panelWidth
+                || mouseY < settingsPanelY || mouseY > settingsPanelY + 256f) {
+            settingsPanelOpen = false;
+            return false;
+        }
+
+        float currentY = settingsPanelY + padding + 14f + 4f;
+
+        if (isInBounds(mouseX, mouseY, settingsPanelX, currentY, panelWidth, itemHeight)) {
+            showNotifications = !showNotifications; return true;
+        }
+        currentY += itemHeight;
+
+        if (isInBounds(mouseX, mouseY, settingsPanelX, currentY, panelWidth, itemHeight)) {
+            showPvp = !showPvp; return true;
+        }
+        currentY += itemHeight;
+
+        if (isInBounds(mouseX, mouseY, settingsPanelX, currentY, panelWidth, itemHeight)) {
+            showBlink = !showBlink; return true;
+        }
+        currentY += itemHeight;
+
+        if (isInBounds(mouseX, mouseY, settingsPanelX, currentY, panelWidth, itemHeight)) {
+            showEvent = !showEvent; return true;
+        }
+        currentY += itemHeight;
+
+        if (isInBounds(mouseX, mouseY, settingsPanelX, currentY, panelWidth, itemHeight)) {
+            showMine = !showMine; return true;
+        }
+        currentY += itemHeight;
+
+        if (isInBounds(mouseX, mouseY, settingsPanelX, currentY, panelWidth, itemHeight)) {
+            viewMode = viewMode == IslandViewMode.NEW ? IslandViewMode.OLD : IslandViewMode.NEW; return true;
+        }
+        currentY += itemHeight;
+
+        if (isInBounds(mouseX, mouseY, settingsPanelX, currentY, panelWidth, itemHeight)) {
+            liquidGlassEnabled = !liquidGlassEnabled; return true;
+        }
+
+        return true;
+    }
+
+    private boolean isInBounds(double mouseX, double mouseY, float x, float y, float width, float height) {
+        return mouseX >= x && mouseX <= x + width && mouseY >= y && mouseY <= y + height;
+    }
+
+    /**
+     * Обработка кликов мыши по островку.
+     */
+    public boolean handleMouseClick(float mouseX, float mouseY, int button, int action) {
+        if (action != 1) return false;
+        boolean islandHovered = isMouseOver(mouseX, mouseY);
+
+        if (button == 0) {
+            if (extended && activeStatus == StatusType.MUSIC) {
+                if (handleMusicClick(mouseX, mouseY)) return true;
+                if (!islandHovered) {
+                    extended = false;
+                    return true;
+                }
+                return true;
+            }
+            if (activeStatus == StatusType.MUSIC && islandHovered) {
+                extended = true;
+                return true;
+            }
+            if (settingsPanelOpen) {
+                return handleSettingsClick(mouseX, mouseY);
+            }
+        }
+
+        if (!(mc.currentScreen instanceof ChatScreen)) {
+            return false;
+        }
+
+        if (button == 1 && islandHovered) {
+            boolean opening = !settingsPanelOpen;
+            settingsPanelOpen = opening;
+            if (opening) rightClickGlintAnimation.setValue(0f);
+            return true;
+        }
+
+        return false;
+    }
+
+    private boolean handleMusicClick(float mouseX, float mouseY) {
+        if (!canShowMusicStatus() || activeSession == null) return false;
+
+        float x = this.x;
+        float y = this.y;
+        float expHeight = showLyrics ? 125.0f : 80.0f;
+        float controlY = y + expHeight - 25.0f * extendingAnim.getValue();
+
+        float buttonStartX = x + (164f - 16f * 3 - 16f) / 2f;
+        float previousX = buttonStartX;
+        float pauseX = previousX + 24f;
+        float nextX = pauseX + 24f;
+        float lyricsX = x + 14.0f;
+        float lyricsY = y + expHeight - 21.0f;
+
+        if (isInBounds(mouseX, mouseY, previousX, controlY, 16.0f, 16.0f)) { controlPrevious(); return true; }
+        if (isInBounds(mouseX, mouseY, pauseX, controlY, 16.0f, 16.0f)) { controlPlayPause(); return true; }
+        if (isInBounds(mouseX, mouseY, nextX, controlY, 16.0f, 16.0f)) { controlNext(); return true; }
+
+        if (!timedLyrics.isEmpty() && isInBounds(mouseX, mouseY, lyricsX, lyricsY, 8.0f, 8.0f)) {
+            showLyrics = !showLyrics;
+            return true;
+        }
+
+        return false;
+    }
+
+    private void controlPrevious() { if (activeSession != null) activeSession.previous(); }
+    private void controlPlayPause() { if (activeSession != null) activeSession.playPause(); }
+    private void controlNext() { if (activeSession != null) activeSession.next(); }
+
+    public void cleanup() {
+        executor.shutdownNow();
+        lyricsExecutor.shutdownNow();
+        clearCoverTexture();
+        EventManager.unregister(this);
+    }
+
+    @Override
+    public JsonObject save() {
+        JsonObject obj = super.save();
+        obj.addProperty("di_showNotifications", showNotifications);
+        obj.addProperty("di_showPvp", showPvp);
+        obj.addProperty("di_showBlink", showBlink);
+        obj.addProperty("di_showEvent", showEvent);
+        obj.addProperty("di_showMine", showMine);
+        obj.addProperty("di_showDefault", showDefault);
+        obj.addProperty("di_liquidGlassEnabled", liquidGlassEnabled);
+        obj.addProperty("di_viewMode", viewMode.name());
+        return obj;
+    }
+
+    @Override
+    public void load(JsonObject obj) {
+        super.load(obj);
+        if (obj.has("di_showNotifications")) showNotifications = obj.get("di_showNotifications").getAsBoolean();
+        if (obj.has("di_showPvp")) showPvp = obj.get("di_showPvp").getAsBoolean();
+        if (obj.has("di_showBlink")) showBlink = obj.get("di_showBlink").getAsBoolean();
+        if (obj.has("di_showEvent")) showEvent = obj.get("di_showEvent").getAsBoolean();
+        if (obj.has("di_showMine")) showMine = obj.get("di_showMine").getAsBoolean();
+        if (obj.has("di_showDefault")) showDefault = obj.get("di_showDefault").getAsBoolean();
+        if (obj.has("di_liquidGlassEnabled")) liquidGlassEnabled = obj.get("di_liquidGlassEnabled").getAsBoolean();
+
+        if (obj.has("di_viewMode")) {
+            try { viewMode = IslandViewMode.valueOf(obj.get("di_viewMode").getAsString()); }
+            catch (Exception ignored) { viewMode = IslandViewMode.OLD; }
+        }
+
+        liquidGlassAnimation.setValue(liquidGlassEnabled ? 1f : 0f);
+    }
+
+    private String generateFallbackUrl(String artist, String title) {
+        String artistSlug = artist != null ? toSlug(artist) : "";
+        String titleSlug = toSlug(title);
+        if (artistSlug.isEmpty()) return "https://genius.com/" + titleSlug + "-lyrics";
+        return "https://genius.com/" + artistSlug + "-" + titleSlug + "-lyrics";
+    }
+
+    private String toSlug(String s) {
+        if (s == null || s.isEmpty()) return "";
+        StringBuilder slug = new StringBuilder();
+        for (char c : s.toCharArray()) {
+            String mapped = transliterateCyrillic(c);
+            if (mapped != null) {
+                slug.append(mapped);
+            } else if (Character.isLetterOrDigit(c)) {
+                slug.append(Character.toLowerCase(c));
+            } else if (c == ' ' || c == '-' || c == '_') {
+                slug.append('-');
+            }
+        }
+        return slug.toString().replaceAll("-+", "-").replaceAll("^-|-$", "");
+    }
+
+    private String transliterateCyrillic(char c) {
+        return switch (c) {
+            case 'а' -> "a";
+            case 'б' -> "b";
+            case 'в' -> "v";
+            case 'г' -> "g";
+            case 'д' -> "d";
+            case 'е' -> "e";
+            case 'ё' -> "yo";
+            case 'ж' -> "zh";
+            case 'з' -> "z";
+            case 'и' -> "i";
+            case 'й' -> "y";
+            case 'к' -> "k";
+            case 'л' -> "l";
+            case 'м' -> "m";
+            case 'н' -> "n";
+            case 'о' -> "o";
+            case 'п' -> "p";
+            case 'р' -> "r";
+            case 'с' -> "s";
+            case 'т' -> "t";
+            case 'у' -> "u";
+            case 'ф' -> "f";
+            case 'х' -> "kh";
+            case 'ц' -> "ts";
+            case 'ч' -> "ch";
+            case 'ш' -> "sh";
+            case 'щ' -> "sch";
+            case 'ъ' -> "";
+            case 'ы' -> "y";
+            case 'ь' -> "";
+            case 'э' -> "e";
+            case 'ю' -> "yu";
+            case 'я' -> "ya";
+            default -> null;
+        };
+    }
+
+    /**
+     * Сохранение лирики в JSON-файл (для отладки/кеширования).
+     */
+    private void saveLyricsToJson(String trackId, String title, String artist, String rawLyrics, List<LyricLine> lyrics, String sourceUrl) {
+        try {
+            File dir = new File(mc.runDirectory, "zenith/lyrics_dump");
+            if (!dir.exists()) dir.mkdirs();
+            String safeName = trackId.replaceAll("[\\\\/:*?\"<>|]", "_");
+            File file = new File(dir, safeName + ".json");
+
+            JsonObject root = new JsonObject();
+            root.addProperty("trackId", trackId);
+            root.addProperty("title", title);
+            root.addProperty("artist", artist != null ? artist : "");
+
+            String url = (sourceUrl != null && !sourceUrl.isEmpty()) ? sourceUrl : generateFallbackUrl(artist, title);
+            root.addProperty("sourceUrl", url);
+            root.addProperty("rawText", rawLyrics != null ? rawLyrics : "");
+
+            JsonArray timeArray = new JsonArray();
+            for (LyricLine line : lyrics) {
+                JsonObject lineObj = new JsonObject();
+                long seconds = line.timeMs / 1000;
+                long minutes = seconds / 60;
+                long secs = seconds % 60;
+                lineObj.addProperty("time", String.format("%02d:%02d", minutes, secs));
+                lineObj.addProperty("text", line.text);
+                timeArray.add(lineObj);
+            }
+
+            root.add("timedLyrics", timeArray);
+            root.addProperty("PrintText", rawLyrics != null ? rawLyrics : "");
+
+            try (FileWriter writer = new FileWriter(file)) {
+                writer.write(root.toString());
+            }
+        } catch (IOException e) {
+            System.err.println("[DynamicIsland] Failed to save lyrics JSON: " + e.getMessage());
+        }
+    }
+
+    // -------------------------
+    // Текстурный фильтр для “непиксельных” иконок
+    // -------------------------
+    private static void setLinearTextureFiltering(boolean linear) {
+        int min = linear ? GL11.GL_LINEAR : GL11.GL_NEAREST;
+        int mag = linear ? GL11.GL_LINEAR : GL11.GL_NEAREST;
+        RenderSystem.texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, min);
+        RenderSystem.texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, mag);
+    }
+}
